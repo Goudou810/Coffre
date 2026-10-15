@@ -169,10 +169,13 @@ jobs:
                   }
 
                   @JavascriptInterface
-                  public void pickFolder() {
+                  public void pickFile() {
                       runOnUiThread(() -> {
                           busy = true;
-                          Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                          Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                          i.addCategory(Intent.CATEGORY_OPENABLE);
+                          i.setType("application/octet-stream");
+                          i.putExtra(Intent.EXTRA_TITLE, Backup.fname());
                           i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                                   | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
                           startActivityForResult(i, 1);
@@ -231,9 +234,12 @@ jobs:
                   final Uri u = d.getData();
                   try {
                       if (rq == 1) {
-                          getContentResolver().takePersistableUriPermission(u,
-                                  Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-                          Backup.p(this).edit().putString("tree", u.toString()).remove("doc").apply();
+                          try {
+                              getContentResolver().takePersistableUriPermission(u,
+                                      Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                          } catch (Exception e) {
+                          }
+                          Backup.p(this).edit().putString("doc", u.toString()).apply();
                           new Thread(() -> {
                               Backup.run(MainActivity.this);
                               runOnUiThread(() -> w.evaluateJavascript("bk()", null));
@@ -342,12 +348,12 @@ jobs:
           cat > app/src/main/java/com/coffre/app/Backup.java <<'EOF_5'
           package com.coffre.app;
 
-          import android.content.ContentResolver;
           import android.content.Context;
           import android.content.SharedPreferences;
+          import android.database.Cursor;
           import android.net.Uri;
           import android.os.Build;
-          import android.provider.DocumentsContract;
+          import android.provider.OpenableColumns;
           import java.io.OutputStream;
           import java.nio.file.Files;
 
@@ -364,40 +370,33 @@ jobs:
                   return "coffre-" + dev().replaceAll("[^A-Za-z0-9]+", "-") + ".bin";
               }
 
+              static String name(Context c, Uri u) {
+                  try (Cursor q = c.getContentResolver().query(u, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                      if (q != null && q.moveToFirst()) return q.getString(0);
+                  } catch (Exception e) {
+                  }
+                  return "fichier choisi";
+              }
+
               static String info(Context c) {
                   SharedPreferences s = p(c);
-                  String t = s.getString("tree", null);
-                  String f = "";
-                  if (t != null) {
-                      String seg = Uri.parse(t).getLastPathSegment();
-                      if (seg != null) f = seg;
-                  }
+                  String d = s.getString("doc", null);
+                  String f = d == null ? "" : name(c, Uri.parse(d));
                   return "{\"d\":\"" + dev().replace("\"", "") + "\",\"f\":\"" + f.replace("\\", "").replace("\"", "")
                           + "\",\"t\":" + s.getLong("t", 0) + "}";
               }
 
               static boolean run(Context c) {
                   try {
-                      String t = p(c).getString("tree", null);
-                      if (t == null) return false;
-                      Uri tree = Uri.parse(t);
-                      ContentResolver r = c.getContentResolver();
-                      byte[] b = Files.readAllBytes(Vault.file(c).toPath());
-                      OutputStream o = null;
                       String d = p(c).getString("doc", null);
-                      if (d != null) {
-                          try {
-                              o = r.openOutputStream(Uri.parse(d), "wt");
-                          } catch (Exception e) {
-                              o = null;
-                          }
-                      }
-                      if (o == null) {
-                          Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
-                          Uri doc = DocumentsContract.createDocument(r, parent, "application/octet-stream", fname());
-                          if (doc == null) return false;
-                          p(c).edit().putString("doc", doc.toString()).apply();
-                          o = r.openOutputStream(doc, "wt");
+                      if (d == null) return false;
+                      byte[] b = Files.readAllBytes(Vault.file(c).toPath());
+                      Uri u = Uri.parse(d);
+                      OutputStream o;
+                      try {
+                          o = c.getContentResolver().openOutputStream(u, "wt");
+                      } catch (Exception e) {
+                          o = c.getContentResolver().openOutputStream(u, "w");
                       }
                       o.write(b);
                       o.close();
@@ -490,9 +489,9 @@ jobs:
           <p class="mu" style="text-align:left">Appareil détecté : <b id="dv"></b></p>
           <label>Sauvegarde automatique</label>
           <div id="bs" class="mu" style="text-align:left;white-space:pre-line;margin-bottom:10px"></div>
-          <button class="btn" id="bf" style="width:100%">Choisir le dossier de sauvegarde</button>
+          <button class="btn" id="bf" style="width:100%">Choisir où sauvegarder</button>
           <button class="btn g" id="bn" style="width:100%;margin-top:8px">Sauvegarder maintenant</button>
-          <p class="mu" style="text-align:left;margin-top:14px">La sauvegarde est chiffrée avec ton code. Choisis un dossier Google Drive pour la garder hors du téléphone : elle est mise à jour après chaque modification.</p>
+          <p class="mu" style="text-align:left;margin-top:14px">La sauvegarde est chiffrée avec ton code. Au choix : Google Drive, si Android te le permet, ou le stockage du téléphone. Le fichier est mis à jour après chaque modification.</p>
           </div>
           <nav><button id="n0" class="on">Coffre</button><button id="n1">Générateur</button><button id="n2">Réglages</button></nav>
           </div>
@@ -592,10 +591,10 @@ jobs:
            if(!A)return;
            let i={};try{i=JSON.parse(A.info())}catch(x){}
            $("dv").textContent=i.d||"inconnu";
-           $("bs").textContent=i.f?"Dossier : "+i.f+(i.t?"\nDernière sauvegarde : "+new Date(i.t).toLocaleString("fr-FR"):"\nPas encore de sauvegarde"):"Désactivée : choisis un dossier pour l'activer.";
+           $("bs").textContent=i.f?"Fichier : "+i.f+(i.t?"\nDernière sauvegarde : "+new Date(i.t).toLocaleString("fr-FR"):"\nPas encore de sauvegarde"):"Désactivée : choisis un emplacement pour l'activer.";
           }
-          $("bf").onclick=()=>A.pickFolder();
-          $("bn").onclick=()=>{toast(A.backupNow()===true?"Sauvegarde faite":"Choisis d'abord un dossier");bk()};
+          $("bf").onclick=()=>A.pickFile();
+          $("bn").onclick=()=>{toast(A.backupNow()===true?"Sauvegarde faite":"Échec : choisis un emplacement");bk()};
           $("rs").onclick=()=>A.restore();
           showLock();
           </script>
