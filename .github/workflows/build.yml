@@ -1,0 +1,490 @@
+name: Construire le Coffre
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Cle de signature
+        run: |
+          if [ ! -f coffre.keystore ]; then
+            keytool -genkeypair -keystore coffre.keystore -storepass coffre-ks-2026 -keypass coffre-ks-2026 -alias coffre -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Coffre"
+            git config user.name bot
+            git config user.email bot@users.noreply.github.com
+            git add coffre.keystore
+            git commit -m "Cle de signature"
+            git push
+          fi
+      - name: Ecrire le projet
+        run: |
+          mkdir -p app/src/main/java/com/coffre/app app/src/main/assets app/src/main/res/drawable app/src/main/res/mipmap-anydpi
+          cat > settings.gradle <<'EOF_0'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = 'Coffre'
+          include ':app'
+          EOF_0
+          cat > app/build.gradle <<'EOF_1'
+          plugins { id 'com.android.application' version '8.5.2' }
+
+          android {
+              namespace 'com.coffre.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.coffre.app'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode Integer.parseInt(System.getenv('GITHUB_RUN_NUMBER') ?: '1')
+                  versionName '1.0'
+              }
+              signingConfigs {
+                  main {
+                      storeFile file("$rootDir/coffre.keystore")
+                      storePassword 'coffre-ks-2026'
+                      keyAlias 'coffre'
+                      keyPassword 'coffre-ks-2026'
+                  }
+              }
+              buildTypes {
+                  debug { signingConfig signingConfigs.main }
+              }
+          }
+          EOF_1
+          cat > app/src/main/AndroidManifest.xml <<'EOF_2'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Coffre"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_2
+          cat > app/src/main/java/com/coffre/app/MainActivity.java <<'EOF_3'
+          package com.coffre.app;
+
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.PersistableBundle;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import java.security.SecureRandom;
+
+          public class MainActivity extends Activity {
+              WebView w;
+              Handler h = new Handler(Looper.getMainLooper());
+
+              public class Bridge {
+                  @JavascriptInterface
+                  public boolean has() {
+                      return Vault.file(MainActivity.this).exists();
+                  }
+
+                  @JavascriptInterface
+                  public boolean create(String pin, String json) {
+                      try {
+                          byte[] s = new byte[16];
+                          new SecureRandom().nextBytes(s);
+                          Vault.salt = s;
+                          Vault.key = Vault.derive(pin, s);
+                          Vault.write(MainActivity.this, json);
+                          return true;
+                      } catch (Exception e) {
+                          return false;
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public String unlock(String pin) {
+                      try {
+                          return Vault.open(MainActivity.this, pin);
+                      } catch (Exception e) {
+                          return null;
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public boolean save(String json) {
+                      try {
+                          if (Vault.key == null) return false;
+                          Vault.write(MainActivity.this, json);
+                          return true;
+                      } catch (Exception e) {
+                          return false;
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public void lock() {
+                      Vault.key = null;
+                  }
+
+                  @JavascriptInterface
+                  public void copy(final String t) {
+                      runOnUiThread(() -> {
+                          final ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                          ClipData d = ClipData.newPlainText("v", t);
+                          if (Build.VERSION.SDK_INT >= 33) {
+                              PersistableBundle pb = new PersistableBundle();
+                              pb.putBoolean("android.content.extra.IS_SENSITIVE", true);
+                              d.getDescription().setExtras(pb);
+                          }
+                          cm.setPrimaryClip(d);
+                          h.removeCallbacksAndMessages(null);
+                          h.postDelayed(() -> {
+                              if (Build.VERSION.SDK_INT >= 28) cm.clearPrimaryClip();
+                              else cm.setPrimaryClip(ClipData.newPlainText("", ""));
+                          }, 30000);
+                      });
+                  }
+              }
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  getWindow().setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE);
+                  w = new WebView(this);
+                  w.getSettings().setJavaScriptEnabled(true);
+                  w.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
+                  w.setBackgroundColor(0xFF0E1620);
+                  w.addJavascriptInterface(new Bridge(), "Android");
+                  setContentView(w);
+                  w.loadUrl("file:///android_asset/index.html");
+              }
+
+              @Override
+              protected void onStop() {
+                  super.onStop();
+                  Vault.key = null;
+                  w.evaluateJavascript("lockUI()", null);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  w.evaluateJavascript("back()", v -> {
+                      if (!"true".equals(v)) finish();
+                  });
+              }
+          }
+          EOF_3
+          cat > app/src/main/java/com/coffre/app/Vault.java <<'EOF_4'
+          package com.coffre.app;
+
+          import android.content.Context;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.nio.file.Files;
+          import java.security.SecureRandom;
+          import java.util.Arrays;
+          import javax.crypto.Cipher;
+          import javax.crypto.SecretKeyFactory;
+          import javax.crypto.spec.GCMParameterSpec;
+          import javax.crypto.spec.PBEKeySpec;
+          import javax.crypto.spec.SecretKeySpec;
+
+          public class Vault {
+              static SecretKeySpec key;
+              static byte[] salt;
+
+              static File file(Context c) {
+                  return new File(c.getFilesDir(), "vault.bin");
+              }
+
+              static SecretKeySpec derive(String pin, byte[] s) throws Exception {
+                  SecretKeyFactory f = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+                  byte[] k = f.generateSecret(new PBEKeySpec(pin.toCharArray(), s, 310000, 256)).getEncoded();
+                  return new SecretKeySpec(k, "AES");
+              }
+
+              static void write(Context c, String json) throws Exception {
+                  byte[] iv = new byte[12];
+                  new SecureRandom().nextBytes(iv);
+                  Cipher ci = Cipher.getInstance("AES/GCM/NoPadding");
+                  ci.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(128, iv));
+                  byte[] ct = ci.doFinal(json.getBytes("UTF-8"));
+                  ByteArrayOutputStream o = new ByteArrayOutputStream();
+                  o.write(salt);
+                  o.write(iv);
+                  o.write(ct);
+                  File tmp = new File(c.getFilesDir(), "vault.tmp");
+                  FileOutputStream fo = new FileOutputStream(tmp);
+                  fo.write(o.toByteArray());
+                  fo.getFD().sync();
+                  fo.close();
+                  if (!tmp.renameTo(file(c))) throw new Exception("rename");
+              }
+
+              static String open(Context c, String pin) throws Exception {
+                  byte[] b = Files.readAllBytes(file(c).toPath());
+                  byte[] s = Arrays.copyOfRange(b, 0, 16);
+                  byte[] iv = Arrays.copyOfRange(b, 16, 28);
+                  byte[] ct = Arrays.copyOfRange(b, 28, b.length);
+                  SecretKeySpec k = derive(pin, s);
+                  Cipher ci = Cipher.getInstance("AES/GCM/NoPadding");
+                  ci.init(Cipher.DECRYPT_MODE, k, new GCMParameterSpec(128, iv));
+                  String json = new String(ci.doFinal(ct), "UTF-8");
+                  key = k;
+                  salt = s;
+                  return json;
+              }
+          }
+          EOF_4
+          cat > app/src/main/assets/index.html <<'EOF_5'
+          <!DOCTYPE html>
+          <html lang="fr">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Coffre</title>
+          <style>
+          :root{--bg:#0E1620;--sf:#16222F;--ln:#25364A;--ink:#E8EEF4;--mu:#8FA3B5;--br:#D4A84B;--rd:#E5676B;color-scheme:dark}
+          *{box-sizing:border-box}
+          html,body{height:100%;margin:0}
+          body{background:var(--bg);color:var(--ink);font:16px/1.4 system-ui,sans-serif;overflow:hidden}
+          button,input,textarea{font:inherit;color:inherit}
+          input,textarea{width:100%;background:var(--sf);border:1px solid var(--ln);border-radius:8px;padding:12px}
+          input:focus,textarea:focus{outline:2px solid var(--br);outline-offset:-1px}
+          input[type=range]{padding:0}
+          .btn{border:0;border-radius:8px;padding:13px;background:var(--br);color:#1a1405;font-weight:700}
+          .btn.g{background:var(--sf);color:var(--ink);border:1px solid var(--ln)}
+          .btn.r{background:none;color:var(--rd);border:1px solid var(--rd)}
+          #lock{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:24px}
+          .box{width:100%;max-width:340px;display:flex;flex-direction:column;gap:10px}
+          #dial{width:150px;height:150px;transition:transform .6s cubic-bezier(.5,0,.2,1)}
+          #dial.spin{transform:rotate(360deg)}
+          .sh{animation:sh .35s}
+          @keyframes sh{20%,60%{transform:translateX(-8px)}40%,80%{transform:translateX(8px)}}
+          h1{margin:0;font-size:26px;text-align:center}
+          .mu{color:var(--mu);font-size:14px;margin:0;text-align:center}
+          #err{color:var(--rd);min-height:20px;text-align:center;font-size:14px}
+          #app{display:none;flex-direction:column;height:100%}
+          header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--ln)}
+          header b{font-size:20px}
+          .v{flex:1;overflow:auto;padding:14px 16px 90px;display:none}
+          .v.on{display:block}
+          .it{display:flex;width:100%;align-items:center;gap:12px;padding:10px 0;border:0;border-bottom:1px solid var(--ln);background:none;text-align:left}
+          .bd{flex:none;width:40px;height:40px;border-radius:50%;background:var(--sf);border:1px solid var(--br);color:var(--br);display:grid;place-items:center;font-weight:700}
+          .it small{display:block;color:var(--mu)}
+          .fab{position:fixed;right:18px;bottom:78px;width:56px;height:56px;border-radius:50%;border:0;background:var(--br);color:#1a1405;font-size:30px;line-height:1}
+          nav{display:flex;border-top:1px solid var(--ln);background:var(--sf)}
+          nav button{flex:1;border:0;background:none;color:var(--mu);padding:14px 0;font-weight:600}
+          nav button.on{color:var(--br);box-shadow:inset 0 3px 0 var(--br)}
+          #sheet{position:fixed;inset:0;background:var(--bg);overflow:auto;padding:16px;display:none;z-index:5}
+          #sheet.on{display:block}
+          label{display:block;color:var(--mu);font-size:13px;margin:12px 0 4px}
+          .rw{display:flex;gap:6px;align-items:center}
+          .rw input{flex:1;min-width:0;width:auto}
+          .rw .btn{flex:none;padding:12px}
+          #out{font:600 20px/1.4 ui-monospace,monospace;word-break:break-all;background:var(--sf);border:1px solid var(--ln);border-radius:8px;padding:14px;margin:0 0 10px;min-height:60px}
+          .chk{display:flex;align-items:center;gap:10px;color:var(--ink);font-size:16px}
+          .chk input{width:auto}
+          #toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:var(--ink);color:#0E1620;padding:8px 14px;border-radius:20px;display:none;z-index:9}
+          .empty{color:var(--mu);text-align:center;margin-top:40px}
+          </style>
+          </head>
+          <body>
+          <div id="lock">
+          <svg id="dial" viewBox="0 0 200 200"><circle cx="100" cy="100" r="92" fill="none" stroke="#D4A84B" stroke-width="4"/><g id="dt" stroke="#D4A84B" stroke-linecap="round"></g><circle cx="100" cy="100" r="58" fill="#16222F" stroke="#25364A" stroke-width="3"/><circle cx="100" cy="100" r="12" fill="#D4A84B"/><path d="M100 36L94 48H106Z" fill="#E8EEF4"/></svg>
+          <div class="box" id="box">
+          <h1>Coffre</h1>
+          <p class="mu" id="msg"></p>
+          <input id="pin" type="password" placeholder="Code secret" autocomplete="off">
+          <input id="pin2" type="password" placeholder="Confirmer le code" autocomplete="off">
+          <div id="err"></div>
+          <button class="btn" id="go"></button>
+          </div>
+          </div>
+          <div id="app">
+          <header><b>Coffre</b><button class="btn g" id="lk">Verrouiller</button></header>
+          <div id="v0" class="v on"><input id="q" placeholder="Rechercher" autocomplete="off"><div id="list"></div><button class="fab" id="add" aria-label="Ajouter">+</button></div>
+          <div id="v1" class="v">
+          <div id="out"></div>
+          <div class="rw"><button class="btn" id="gn" style="flex:1">Générer</button><button class="btn g" id="co" style="flex:1">Copier</button></div>
+          <label>Longueur : <b id="ln">20</b></label><input id="len" type="range" min="8" max="40" value="20">
+          <label class="chk"><input id="up" type="checkbox" checked> Majuscules</label>
+          <label class="chk"><input id="dg" type="checkbox" checked> Chiffres</label>
+          <label class="chk"><input id="sy" type="checkbox" checked> Symboles</label>
+          </div>
+          <nav><button id="n0" class="on">Coffre</button><button id="n1">Générateur</button></nav>
+          </div>
+          <div id="sheet">
+          <div class="rw" style="justify-content:space-between"><b id="sh_t">Nouvelle entrée</b><button class="btn g" id="cl">Fermer</button></div>
+          <label>Titre</label><input id="f_t" autocomplete="off">
+          <label>Identifiant</label><div class="rw"><input id="f_u" autocomplete="off"><button class="btn g" id="cu">Copier</button></div>
+          <label>Mot de passe</label><div class="rw"><input id="f_p" type="password" autocomplete="off"><button class="btn g" id="sp">Voir</button><button class="btn g" id="cp">Copier</button></div>
+          <button class="btn g" id="gp" style="margin-top:8px;width:100%">Générer un mot de passe</button>
+          <label>Note</label><textarea id="f_n" rows="5"></textarea>
+          <div class="box" style="max-width:none;margin-top:16px"><button class="btn" id="sv">Enregistrer</button><button class="btn r" id="dl">Supprimer</button></div>
+          </div>
+          <div id="toast"></div>
+          <script>
+          const $=id=>document.getElementById(id),A=window.Android;
+          let E=[],cur=null,mode,fails=0,until=0,del=0,tt;
+          const NS="http://www.w3.org/2000/svg";
+          for(let i=0;i<36;i++){const a=i*Math.PI/18,r=i%3?82:77,l=document.createElementNS(NS,"line");l.setAttribute("x1",100+r*Math.sin(a));l.setAttribute("y1",100-r*Math.cos(a));l.setAttribute("x2",100+88*Math.sin(a));l.setAttribute("y2",100-88*Math.cos(a));l.setAttribute("stroke-width",i%9?1.5:3);$("dt").append(l)}
+          function toast(m){const t=$("toast");t.textContent=m;t.style.display="block";clearTimeout(tt);tt=setTimeout(()=>t.style.display="none",1800)}
+          function err(m){$("err").textContent=m}
+          function idle(){$("go").disabled=false;$("go").textContent=mode=="create"?"Créer le coffre":"Déverrouiller"}
+          function showLock(){
+           E=[];cur=null;$("sheet").classList.remove("on");$("app").style.display="none";$("lock").style.display="flex";
+           $("pin").value="";$("pin2").value="";err("");
+           mode=A&&A.has()?"unlock":"create";
+           $("pin2").style.display=mode=="create"?"block":"none";
+           $("msg").textContent=mode=="create"?"Choisis un code secret (6 caractères minimum). Impossible de le récupérer si tu l'oublies.":"Entre ton code pour ouvrir le coffre.";
+           idle();
+          }
+          function lockUI(){if(A)A.lock();showLock()}
+          function enter(){const d=$("dial");d.classList.add("spin");setTimeout(()=>{d.classList.remove("spin");$("lock").style.display="none";$("app").style.display="flex";tab(0);list()},650)}
+          $("go").onclick=()=>{
+           if(!A){err("Ouvre ce coffre depuis l'application.");return}
+           const p=$("pin").value;err("");
+           if(Date.now()<until){err("Attends "+Math.ceil((until-Date.now())/1000)+" s");return}
+           if(mode=="create"){
+            if(p.length<6){err("6 caractères minimum");return}
+            if(p!==$("pin2").value){err("Les deux codes sont différents");return}
+           }
+           $("go").disabled=true;$("go").textContent="…";
+           setTimeout(()=>{
+            if(mode=="create"){if(A.create(p,JSON.stringify({e:[]}))){E=[];enter()}else{err("Création impossible");idle()}return}
+            const r=A.unlock(p);
+            if(r===null){fails++;until=Date.now()+Math.min(fails*2,30)*1000;err("Code incorrect");const b=$("box");b.classList.remove("sh");void b.offsetWidth;b.classList.add("sh");idle();return}
+            try{E=JSON.parse(r).e||[]}catch(x){E=[]}
+            fails=0;$("pin").value="";enter();
+           },60);
+          };
+          function tab(i){[0,1].forEach(k=>{$("v"+k).classList.toggle("on",k==i);$("n"+k).classList.toggle("on",k==i)});if(i==1&&!$("out").textContent)$("out").textContent=gen()}
+          $("n0").onclick=()=>tab(0);$("n1").onclick=()=>tab(1);$("lk").onclick=lockUI;
+          function list(){
+           const q=$("q").value.toLowerCase(),L=$("list");L.innerHTML="";
+           const f=E.filter(x=>(x.t+" "+x.u).toLowerCase().includes(q)).sort((a,b)=>a.t.localeCompare(b.t));
+           if(!f.length){const p=document.createElement("p");p.className="empty";p.textContent=E.length?"Aucun résultat":"Ton coffre est vide. Touche + pour ajouter un mot de passe ou une note.";L.append(p)}
+           f.forEach(x=>{
+            const b=document.createElement("button"),d=document.createElement("div"),s=document.createElement("span"),m=document.createElement("small");
+            b.className="it";d.className="bd";d.textContent=(x.t[0]||"?").toUpperCase();
+            s.textContent=x.t;m.textContent=x.u||(x.p?"Mot de passe":"Note");s.append(m);
+            b.append(d,s);b.onclick=()=>edit(x);L.append(b);
+           });
+          }
+          $("q").oninput=list;
+          function edit(x){cur=x||null;$("sh_t").textContent=x?"Modifier":"Nouvelle entrée";$("f_t").value=x?x.t:"";$("f_u").value=x?x.u:"";$("f_p").value=x?x.p:"";$("f_p").type="password";$("sp").textContent="Voir";$("f_n").value=x?x.n:"";$("dl").style.display=x?"block":"none";$("sheet").classList.add("on")}
+          $("add").onclick=()=>edit();
+          $("cl").onclick=()=>$("sheet").classList.remove("on");
+          function persist(){if(!A.save(JSON.stringify({e:E})))toast("Échec de l'enregistrement")}
+          $("sv").onclick=()=>{
+           const o={t:$("f_t").value.trim(),u:$("f_u").value.trim(),p:$("f_p").value,n:$("f_n").value};
+           if(!o.t){toast("Donne un titre");return}
+           if(cur)Object.assign(cur,o);else E.push(Object.assign({id:Date.now()},o));
+           persist();$("sheet").classList.remove("on");list();
+          };
+          $("dl").onclick=()=>{
+           if(del){del=0;E=E.filter(x=>x!==cur);persist();$("sheet").classList.remove("on");list();$("dl").textContent="Supprimer";return}
+           del=1;$("dl").textContent="Confirmer la suppression";setTimeout(()=>{del=0;$("dl").textContent="Supprimer"},3000);
+          };
+          $("sp").onclick=()=>{const p=$("f_p");p.type=p.type=="password"?"text":"password";$("sp").textContent=p.type=="password"?"Voir":"Cacher"};
+          $("cu").onclick=()=>{A.copy($("f_u").value);toast("Identifiant copié")};
+          $("cp").onclick=()=>{A.copy($("f_p").value);toast("Mot de passe copié")};
+          $("gp").onclick=()=>{$("f_p").value=gen();$("f_p").type="text";$("sp").textContent="Cacher"};
+          function gen(){
+           const n=+$("len").value,u=$("up").checked,d=$("dg").checked,y=$("sy").checked;
+           let s="abcdefghijkmnopqrstuvwxyz";if(u)s+="ABCDEFGHJKLMNPQRSTUVWXYZ";if(d)s+="23456789";if(y)s+="!@#$%&*?-_+=";
+           const lim=Math.floor(4294967296/s.length)*s.length,b=new Uint32Array(1);let o;
+           do{o=[];while(o.length<n){crypto.getRandomValues(b);if(b[0]<lim)o.push(s[b[0]%s.length])}o=o.join("")}
+           while((u&&!/[A-Z]/.test(o))||(d&&!/[2-9]/.test(o))||(y&&!/[^a-zA-Z0-9]/.test(o)));
+           return o;
+          }
+          $("gn").onclick=()=>$("out").textContent=gen();
+          $("co").onclick=()=>{A.copy($("out").textContent);toast("Copié")};
+          $("len").oninput=()=>{$("ln").textContent=$("len").value;$("out").textContent=gen()};
+          ["up","dg","sy"].forEach(i=>$(i).onchange=()=>$("out").textContent=gen());
+          function back(){if($("sheet").classList.contains("on")){$("sheet").classList.remove("on");return true}if($("n1").classList.contains("on")){tab(0);return true}return false}
+          showLock();
+          </script>
+          </body>
+          </html>
+          EOF_5
+          cat > app/src/main/res/drawable/ic_fg.xml <<'EOF_6'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#00000000"
+                  android:strokeColor="#D4A84B"
+                  android:strokeWidth="5"
+                  android:pathData="M54,54m-26,0a26,26 0 1,1 52,0a26,26 0 1,1 -52,0"/>
+              <path
+                  android:fillColor="#00000000"
+                  android:strokeColor="#E8EEF4"
+                  android:strokeWidth="3.5"
+                  android:pathData="M54,54m-13,0a13,13 0 1,1 26,0a13,13 0 1,1 -26,0"/>
+              <path
+                  android:fillColor="#D4A84B"
+                  android:pathData="M54,54m-4,0a4,4 0 1,1 8,0a4,4 0 1,1 -8,0"/>
+              <path
+                  android:fillColor="#00000000"
+                  android:strokeColor="#E8EEF4"
+                  android:strokeWidth="4"
+                  android:strokeLineCap="round"
+                  android:pathData="M54,29L54,36"/>
+          </vector>
+          EOF_6
+          cat > app/src/main/res/drawable/ic_bg.xml <<'EOF_7'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#0E1620"
+                  android:pathData="M0,0h108v108h-108z"/>
+          </vector>
+          EOF_7
+          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF_8'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/ic_bg"/>
+              <foreground android:drawable="@drawable/ic_fg"/>
+          </adaptive-icon>
+          EOF_8
+      - name: Compiler
+        run: gradle assembleDebug --no-daemon
+      - name: Publier l'APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk coffre.apk
+          gh release delete apk -y --cleanup-tag || true
+          gh release create apk coffre.apk --title "Coffre" --notes "APK du Coffre"
