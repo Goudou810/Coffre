@@ -46,7 +46,7 @@ jobs:
                   minSdk 26
                   targetSdk 34
                   versionCode Integer.parseInt(System.getenv('GITHUB_RUN_NUMBER') ?: '1')
-                  versionName '1.0'
+                  versionName '1.1'
               }
               signingConfigs {
                   main {
@@ -88,6 +88,8 @@ jobs:
           import android.app.Activity;
           import android.content.ClipData;
           import android.content.ClipboardManager;
+          import android.content.Intent;
+          import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
           import android.os.Handler;
@@ -97,11 +99,16 @@ jobs:
           import android.view.WindowManager;
           import android.webkit.JavascriptInterface;
           import android.webkit.WebView;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
           import java.security.SecureRandom;
 
           public class MainActivity extends Activity {
               WebView w;
               Handler h = new Handler(Looper.getMainLooper());
+              boolean busy = false;
 
               public class Bridge {
                   @JavascriptInterface
@@ -112,11 +119,13 @@ jobs:
                   @JavascriptInterface
                   public boolean create(String pin, String json) {
                       try {
+                          if (Vault.file(MainActivity.this).exists()) return false;
                           byte[] s = new byte[16];
                           new SecureRandom().nextBytes(s);
                           Vault.salt = s;
                           Vault.key = Vault.derive(pin, s);
                           Vault.write(MainActivity.this, json);
+                          Backup.run(MainActivity.this);
                           return true;
                       } catch (Exception e) {
                           return false;
@@ -126,9 +135,9 @@ jobs:
                   @JavascriptInterface
                   public String unlock(String pin) {
                       try {
-                          return Vault.open(MainActivity.this, pin);
+                          return "OK" + Vault.open(MainActivity.this, pin);
                       } catch (Exception e) {
-                          return null;
+                          return "ERR";
                       }
                   }
 
@@ -137,6 +146,7 @@ jobs:
                       try {
                           if (Vault.key == null) return false;
                           Vault.write(MainActivity.this, json);
+                          Backup.run(MainActivity.this);
                           return true;
                       } catch (Exception e) {
                           return false;
@@ -146,6 +156,38 @@ jobs:
                   @JavascriptInterface
                   public void lock() {
                       Vault.key = null;
+                  }
+
+                  @JavascriptInterface
+                  public String info() {
+                      return Backup.info(MainActivity.this);
+                  }
+
+                  @JavascriptInterface
+                  public boolean backupNow() {
+                      return Backup.run(MainActivity.this);
+                  }
+
+                  @JavascriptInterface
+                  public void pickFolder() {
+                      runOnUiThread(() -> {
+                          busy = true;
+                          Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                          i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                                  | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                          startActivityForResult(i, 1);
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public void restore() {
+                      runOnUiThread(() -> {
+                          busy = true;
+                          Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                          i.addCategory(Intent.CATEGORY_OPENABLE);
+                          i.setType("*/*");
+                          startActivityForResult(i, 2);
+                      });
                   }
 
                   @JavascriptInterface
@@ -182,10 +224,48 @@ jobs:
               }
 
               @Override
+              protected void onActivityResult(int rq, int rs, Intent d) {
+                  super.onActivityResult(rq, rs, d);
+                  busy = false;
+                  if (rs != RESULT_OK || d == null || d.getData() == null) return;
+                  final Uri u = d.getData();
+                  try {
+                      if (rq == 1) {
+                          getContentResolver().takePersistableUriPermission(u,
+                                  Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                          Backup.p(this).edit().putString("tree", u.toString()).remove("doc").apply();
+                          new Thread(() -> {
+                              Backup.run(MainActivity.this);
+                              runOnUiThread(() -> w.evaluateJavascript("bk()", null));
+                          }).start();
+                      } else if (rq == 2) {
+                          InputStream in = getContentResolver().openInputStream(u);
+                          ByteArrayOutputStream o = new ByteArrayOutputStream();
+                          byte[] buf = new byte[8192];
+                          int n;
+                          while ((n = in.read(buf)) > 0) o.write(buf, 0, n);
+                          in.close();
+                          byte[] b = o.toByteArray();
+                          if (b.length < 29 || Vault.file(this).exists()) throw new Exception("bad");
+                          File tmp = new File(getFilesDir(), "vault.tmp");
+                          FileOutputStream fo = new FileOutputStream(tmp);
+                          fo.write(b);
+                          fo.close();
+                          tmp.renameTo(Vault.file(this));
+                          w.evaluateJavascript("showLock();toast('Sauvegarde restaurée : entre ton code')", null);
+                      }
+                  } catch (Exception e) {
+                      w.evaluateJavascript("toast('Échec')", null);
+                  }
+              }
+
+              @Override
               protected void onStop() {
                   super.onStop();
-                  Vault.key = null;
-                  w.evaluateJavascript("lockUI()", null);
+                  if (!busy) {
+                      Vault.key = null;
+                      w.evaluateJavascript("lockUI()", null);
+                  }
               }
 
               @Override
@@ -259,7 +339,77 @@ jobs:
               }
           }
           EOF_4
-          cat > app/src/main/assets/index.html <<'EOF_5'
+          cat > app/src/main/java/com/coffre/app/Backup.java <<'EOF_5'
+          package com.coffre.app;
+
+          import android.content.ContentResolver;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.provider.DocumentsContract;
+          import java.io.OutputStream;
+          import java.nio.file.Files;
+
+          public class Backup {
+              static SharedPreferences p(Context c) {
+                  return c.getSharedPreferences("b", 0);
+              }
+
+              static String dev() {
+                  return (Build.MANUFACTURER + " " + Build.MODEL).trim();
+              }
+
+              static String fname() {
+                  return "coffre-" + dev().replaceAll("[^A-Za-z0-9]+", "-") + ".bin";
+              }
+
+              static String info(Context c) {
+                  SharedPreferences s = p(c);
+                  String t = s.getString("tree", null);
+                  String f = "";
+                  if (t != null) {
+                      String seg = Uri.parse(t).getLastPathSegment();
+                      if (seg != null) f = seg;
+                  }
+                  return "{\"d\":\"" + dev().replace("\"", "") + "\",\"f\":\"" + f.replace("\\", "").replace("\"", "")
+                          + "\",\"t\":" + s.getLong("t", 0) + "}";
+              }
+
+              static boolean run(Context c) {
+                  try {
+                      String t = p(c).getString("tree", null);
+                      if (t == null) return false;
+                      Uri tree = Uri.parse(t);
+                      ContentResolver r = c.getContentResolver();
+                      byte[] b = Files.readAllBytes(Vault.file(c).toPath());
+                      OutputStream o = null;
+                      String d = p(c).getString("doc", null);
+                      if (d != null) {
+                          try {
+                              o = r.openOutputStream(Uri.parse(d), "wt");
+                          } catch (Exception e) {
+                              o = null;
+                          }
+                      }
+                      if (o == null) {
+                          Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+                          Uri doc = DocumentsContract.createDocument(r, parent, "application/octet-stream", fname());
+                          if (doc == null) return false;
+                          p(c).edit().putString("doc", doc.toString()).apply();
+                          o = r.openOutputStream(doc, "wt");
+                      }
+                      o.write(b);
+                      o.close();
+                      p(c).edit().putLong("t", System.currentTimeMillis()).apply();
+                      return true;
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+          }
+          EOF_5
+          cat > app/src/main/assets/index.html <<'EOF_6'
           <!DOCTYPE html>
           <html lang="fr">
           <head>
@@ -322,6 +472,7 @@ jobs:
           <input id="pin2" type="password" placeholder="Confirmer le code" autocomplete="off">
           <div id="err"></div>
           <button class="btn" id="go"></button>
+          <button class="btn g" id="rs">Restaurer une sauvegarde</button>
           </div>
           </div>
           <div id="app">
@@ -335,7 +486,15 @@ jobs:
           <label class="chk"><input id="dg" type="checkbox" checked> Chiffres</label>
           <label class="chk"><input id="sy" type="checkbox" checked> Symboles</label>
           </div>
-          <nav><button id="n0" class="on">Coffre</button><button id="n1">Générateur</button></nav>
+          <div id="v2" class="v">
+          <p class="mu" style="text-align:left">Appareil détecté : <b id="dv"></b></p>
+          <label>Sauvegarde automatique</label>
+          <div id="bs" class="mu" style="text-align:left;white-space:pre-line;margin-bottom:10px"></div>
+          <button class="btn" id="bf" style="width:100%">Choisir le dossier de sauvegarde</button>
+          <button class="btn g" id="bn" style="width:100%;margin-top:8px">Sauvegarder maintenant</button>
+          <p class="mu" style="text-align:left;margin-top:14px">La sauvegarde est chiffrée avec ton code. Choisis un dossier Google Drive pour la garder hors du téléphone : elle est mise à jour après chaque modification.</p>
+          </div>
+          <nav><button id="n0" class="on">Coffre</button><button id="n1">Générateur</button><button id="n2">Réglages</button></nav>
           </div>
           <div id="sheet">
           <div class="rw" style="justify-content:space-between"><b id="sh_t">Nouvelle entrée</b><button class="btn g" id="cl">Fermer</button></div>
@@ -358,13 +517,14 @@ jobs:
           function showLock(){
            E=[];cur=null;$("sheet").classList.remove("on");$("app").style.display="none";$("lock").style.display="flex";
            $("pin").value="";$("pin2").value="";err("");
-           mode=A&&A.has()?"unlock":"create";
+           mode=A&&A.has()===true?"unlock":"create";
+           $("rs").style.display=mode=="create"?"block":"none";
            $("pin2").style.display=mode=="create"?"block":"none";
            $("msg").textContent=mode=="create"?"Choisis un code secret (6 caractères minimum). Impossible de le récupérer si tu l'oublies.":"Entre ton code pour ouvrir le coffre.";
            idle();
           }
           function lockUI(){if(A)A.lock();showLock()}
-          function enter(){const d=$("dial");d.classList.add("spin");setTimeout(()=>{d.classList.remove("spin");$("lock").style.display="none";$("app").style.display="flex";tab(0);list()},650)}
+          function enter(){const d=$("dial");d.classList.add("spin");setTimeout(()=>{d.classList.remove("spin");$("lock").style.display="none";$("app").style.display="flex";tab(0);list();try{if(!JSON.parse(A.info()).f)toast("Pense à activer la sauvegarde (Réglages)")}catch(x){}},650)}
           $("go").onclick=()=>{
            if(!A){err("Ouvre ce coffre depuis l'application.");return}
            const p=$("pin").value;err("");
@@ -375,15 +535,16 @@ jobs:
            }
            $("go").disabled=true;$("go").textContent="…";
            setTimeout(()=>{
-            if(mode=="create"){if(A.create(p,JSON.stringify({e:[]}))){E=[];enter()}else{err("Création impossible");idle()}return}
+            if(mode=="create"){if(A.create(p,JSON.stringify({e:[]}))===true){E=[];enter()}else{err("Création impossible");idle()}return}
             const r=A.unlock(p);
-            if(r===null){fails++;until=Date.now()+Math.min(fails*2,30)*1000;err("Code incorrect");const b=$("box");b.classList.remove("sh");void b.offsetWidth;b.classList.add("sh");idle();return}
-            try{E=JSON.parse(r).e||[]}catch(x){E=[]}
+            let ok=typeof r==="string"&&r.slice(0,2)==="OK";
+            if(ok){try{E=JSON.parse(r.slice(2)).e||[]}catch(x){ok=false}}
+            if(!ok){fails++;until=Date.now()+Math.min(fails*2,30)*1000;err("Code incorrect");const b=$("box");b.classList.remove("sh");void b.offsetWidth;b.classList.add("sh");idle();return}
             fails=0;$("pin").value="";enter();
            },60);
           };
-          function tab(i){[0,1].forEach(k=>{$("v"+k).classList.toggle("on",k==i);$("n"+k).classList.toggle("on",k==i)});if(i==1&&!$("out").textContent)$("out").textContent=gen()}
-          $("n0").onclick=()=>tab(0);$("n1").onclick=()=>tab(1);$("lk").onclick=lockUI;
+          function tab(i){[0,1,2].forEach(k=>{$("v"+k).classList.toggle("on",k==i);$("n"+k).classList.toggle("on",k==i)});if(i==1&&!$("out").textContent)$("out").textContent=gen();if(i==2)bk()}
+          $("n0").onclick=()=>tab(0);$("n1").onclick=()=>tab(1);$("n2").onclick=()=>tab(2);$("lk").onclick=lockUI;
           function list(){
            const q=$("q").value.toLowerCase(),L=$("list");L.innerHTML="";
            const f=E.filter(x=>(x.t+" "+x.u).toLowerCase().includes(q)).sort((a,b)=>a.t.localeCompare(b.t));
@@ -426,13 +587,22 @@ jobs:
           $("co").onclick=()=>{A.copy($("out").textContent);toast("Copié")};
           $("len").oninput=()=>{$("ln").textContent=$("len").value;$("out").textContent=gen()};
           ["up","dg","sy"].forEach(i=>$(i).onchange=()=>$("out").textContent=gen());
-          function back(){if($("sheet").classList.contains("on")){$("sheet").classList.remove("on");return true}if($("n1").classList.contains("on")){tab(0);return true}return false}
+          function back(){if($("lock").style.display=="flex")return false;if($("sheet").classList.contains("on")){$("sheet").classList.remove("on");return true}if(!$("n0").classList.contains("on")){tab(0);return true}return false}
+          function bk(){
+           if(!A)return;
+           let i={};try{i=JSON.parse(A.info())}catch(x){}
+           $("dv").textContent=i.d||"inconnu";
+           $("bs").textContent=i.f?"Dossier : "+i.f+(i.t?"\nDernière sauvegarde : "+new Date(i.t).toLocaleString("fr-FR"):"\nPas encore de sauvegarde"):"Désactivée : choisis un dossier pour l'activer.";
+          }
+          $("bf").onclick=()=>A.pickFolder();
+          $("bn").onclick=()=>{toast(A.backupNow()===true?"Sauvegarde faite":"Choisis d'abord un dossier");bk()};
+          $("rs").onclick=()=>A.restore();
           showLock();
           </script>
           </body>
           </html>
-          EOF_5
-          cat > app/src/main/res/drawable/ic_fg.xml <<'EOF_6'
+          EOF_6
+          cat > app/src/main/res/drawable/ic_fg.xml <<'EOF_7'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
@@ -459,8 +629,8 @@ jobs:
                   android:strokeLineCap="round"
                   android:pathData="M54,29L54,36"/>
           </vector>
-          EOF_6
-          cat > app/src/main/res/drawable/ic_bg.xml <<'EOF_7'
+          EOF_7
+          cat > app/src/main/res/drawable/ic_bg.xml <<'EOF_8'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
@@ -471,14 +641,14 @@ jobs:
                   android:fillColor="#0E1620"
                   android:pathData="M0,0h108v108h-108z"/>
           </vector>
-          EOF_7
-          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF_8'
+          EOF_8
+          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF_9'
           <?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
               <background android:drawable="@drawable/ic_bg"/>
               <foreground android:drawable="@drawable/ic_fg"/>
           </adaptive-icon>
-          EOF_8
+          EOF_9
       - name: Compiler
         run: gradle assembleDebug --no-daemon
       - name: Publier l'APK
