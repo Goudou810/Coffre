@@ -43,10 +43,10 @@ jobs:
               compileSdk 34
               defaultConfig {
                   applicationId 'com.coffre.app'
-                  minSdk 30
+                  minSdk 26
                   targetSdk 34
                   versionCode Integer.parseInt(System.getenv('GITHUB_RUN_NUMBER') ?: '1')
-                  versionName '1.3'
+                  versionName '1.4'
               }
               signingConfigs {
                   main {
@@ -64,7 +64,6 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'EOF_2'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
               <uses-permission android:name="android.permission.INTERNET"/>
               <application
                   android:label="Coffre"
@@ -90,14 +89,8 @@ jobs:
           import android.app.Activity;
           import android.content.ClipData;
           import android.content.ClipboardManager;
-          import android.content.Intent;
-          import android.content.pm.PackageManager;
-          import android.hardware.biometrics.BiometricManager;
-          import android.hardware.biometrics.BiometricPrompt;
-          import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
-          import android.os.CancellationSignal;
           import android.os.Handler;
           import android.os.Looper;
           import android.os.PersistableBundle;
@@ -105,40 +98,19 @@ jobs:
           import android.view.WindowManager;
           import android.webkit.JavascriptInterface;
           import android.webkit.WebView;
-          import java.io.ByteArrayOutputStream;
-          import java.io.File;
-          import java.io.FileOutputStream;
-          import java.io.InputStream;
           import java.security.SecureRandom;
           import org.json.JSONObject;
 
           public class MainActivity extends Activity {
               WebView w;
               Handler h = new Handler(Looper.getMainLooper());
-              boolean busy = false;
 
               void js(final String s) {
                   runOnUiThread(() -> w.evaluateJavascript(s, null));
               }
 
-              void startBio(final int step) {
-                  BiometricPrompt.Builder b = new BiometricPrompt.Builder(this)
-                          .setTitle(step == 3 ? "Étape 3 : visage" : "Étape 4 : empreinte")
-                          .setAllowedAuthenticators(step == 3 ? BiometricManager.Authenticators.BIOMETRIC_WEAK
-                                  : BiometricManager.Authenticators.BIOMETRIC_STRONG)
-                          .setNegativeButton("Annuler", getMainExecutor(), (d, i) -> js("bioDone(" + step + ",false)"));
-                  b.build().authenticate(new CancellationSignal(), getMainExecutor(), new BiometricPrompt.AuthenticationCallback() {
-                      @Override
-                      public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult r) {
-                          if (step == 4) Vault.gate = true;
-                          js("bioDone(" + step + ",true)");
-                      }
-
-                      @Override
-                      public void onAuthenticationError(int code, CharSequence m) {
-                          js("bioDone(" + step + ",false)");
-                      }
-                  });
+              void done(String op, String r) {
+                  js("sdone('" + op + "'," + JSONObject.quote(r) + ")");
               }
 
               public class Bridge {
@@ -153,26 +125,11 @@ jobs:
                   }
 
                   @JavascriptInterface
-                  public String caps() {
-                      BiometricManager bm = getSystemService(BiometricManager.class);
-                      boolean strong = bm.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
-                              == BiometricManager.BIOMETRIC_SUCCESS;
-                      boolean face = getPackageManager().hasSystemFeature(PackageManager.FEATURE_FACE)
-                              && bm.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
-                              == BiometricManager.BIOMETRIC_SUCCESS;
-                      return (face ? "1" : "0") + (strong ? "1" : "0");
-                  }
-
-                  @JavascriptInterface
-                  public void bio(final int step) {
-                      runOnUiThread(() -> startBio(step));
-                  }
-
-                  @JavascriptInterface
                   public String unlock(String pin, String ans) {
                       try {
                           Vault.lock();
                           Vault.open(MainActivity.this, pin, ans);
+                          Vault.pin = pin;
                           return Vault.legacy ? "LEG" : "OK";
                       } catch (Exception e) {
                           Vault.lock();
@@ -182,13 +139,12 @@ jobs:
 
                   @JavascriptInterface
                   public String data() {
-                      return Vault.gate && Vault.json != null ? Vault.json : "ERR";
+                      return Vault.json != null ? Vault.json : "ERR";
                   }
 
                   @JavascriptInterface
                   public boolean setup(String pin, String q, String ans) {
                       try {
-                          if (!Vault.gate) return false;
                           boolean exists = Vault.file(MainActivity.this).exists();
                           if (exists && !Vault.legacy) return false;
                           String j = exists ? Vault.json : "{\"e\":[]}";
@@ -200,7 +156,7 @@ jobs:
                           Vault.key = Vault.derive(pin, ans, s);
                           Vault.write(MainActivity.this);
                           Vault.legacy = false;
-                          Backup.run(MainActivity.this);
+                          Vault.pin = pin;
                           Sync.auto(MainActivity.this);
                           return true;
                       } catch (Exception e) {
@@ -211,10 +167,9 @@ jobs:
                   @JavascriptInterface
                   public boolean save(String j) {
                       try {
-                          if (Vault.key == null || !Vault.gate || Vault.legacy) return false;
+                          if (Vault.key == null || Vault.legacy) return false;
                           Vault.json = j;
                           Vault.write(MainActivity.this);
-                          Backup.run(MainActivity.this);
                           Sync.auto(MainActivity.this);
                           return true;
                       } catch (Exception e) {
@@ -228,63 +183,32 @@ jobs:
                   }
 
                   @JavascriptInterface
-                  public String info() {
-                      return Backup.info(MainActivity.this);
-                  }
-
-                  @JavascriptInterface
-                  public boolean backupNow() {
-                      return Backup.run(MainActivity.this);
-                  }
-
-                  @JavascriptInterface
-                  public void pickFile() {
-                      runOnUiThread(() -> {
-                          busy = true;
-                          Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-                          i.addCategory(Intent.CATEGORY_OPENABLE);
-                          i.setType("application/octet-stream");
-                          i.putExtra(Intent.EXTRA_TITLE, Backup.fname());
-                          i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-                                  | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-                          startActivityForResult(i, 1);
-                      });
-                  }
-
-                  @JavascriptInterface
-                  public void restore() {
-                      runOnUiThread(() -> {
-                          busy = true;
-                          Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                          i.addCategory(Intent.CATEGORY_OPENABLE);
-                          i.setType("*/*");
-                          startActivityForResult(i, 2);
-                      });
-                  }
-
-                  @JavascriptInterface
                   public void acct(final String mode, final String email, final String pw) {
-                      new Thread(() -> js("sdone('acct'," + JSONObject.quote(Sync.login(MainActivity.this, mode, email.trim(), pw)) + ")")).start();
+                      new Thread(() -> done("acct", Sync.login(MainActivity.this, mode, email.trim(), pw))).start();
+                  }
+
+                  @JavascriptInterface
+                  public void acct2(final String mode, final String email) {
+                      final String pin = Vault.pin;
+                      new Thread(() -> {
+                          if (pin == null) done("acct", "ERR:Déverrouille d'abord le coffre");
+                          else done("acct", Sync.login(MainActivity.this, mode, email.trim(), pin));
+                      }).start();
                   }
 
                   @JavascriptInterface
                   public void push(final boolean force) {
-                      new Thread(() -> js("sdone('push'," + JSONObject.quote(Sync.push(MainActivity.this, force)) + ")")).start();
+                      new Thread(() -> done("push", Sync.push(MainActivity.this, force))).start();
                   }
 
                   @JavascriptInterface
                   public void pull(final boolean force) {
-                      new Thread(() -> js("sdone('pull'," + JSONObject.quote(Sync.pull(MainActivity.this, force)) + ")")).start();
+                      new Thread(() -> done("pull", Sync.pull(MainActivity.this, force))).start();
                   }
 
                   @JavascriptInterface
-                  public void logout() {
-                      Sync.p(MainActivity.this).edit().clear().apply();
-                  }
-
-                  @JavascriptInterface
-                  public boolean cfg() {
-                      return !Sync.SB_URL.startsWith("__");
+                  public String logout() {
+                      return Sync.logout(MainActivity.this);
                   }
 
                   @JavascriptInterface
@@ -304,7 +228,10 @@ jobs:
                           }
                           cm.setPrimaryClip(d);
                           h.removeCallbacksAndMessages(null);
-                          h.postDelayed(() -> cm.clearPrimaryClip(), 30000);
+                          h.postDelayed(() -> {
+                              if (Build.VERSION.SDK_INT >= 28) cm.clearPrimaryClip();
+                              else cm.setPrimaryClip(ClipData.newPlainText("", ""));
+                          }, 30000);
                       });
                   }
               }
@@ -316,58 +243,17 @@ jobs:
                   w = new WebView(this);
                   w.getSettings().setJavaScriptEnabled(true);
                   w.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
-                  w.setBackgroundColor(0xFF0E1620);
+                  w.setBackgroundColor(0xFF0B1320);
                   w.addJavascriptInterface(new Bridge(), "Android");
                   setContentView(w);
                   w.loadUrl("file:///android_asset/index.html");
               }
 
               @Override
-              protected void onActivityResult(int rq, int rs, Intent d) {
-                  super.onActivityResult(rq, rs, d);
-                  busy = false;
-                  if (rs != RESULT_OK || d == null || d.getData() == null) return;
-                  final Uri u = d.getData();
-                  try {
-                      if (rq == 1) {
-                          try {
-                              getContentResolver().takePersistableUriPermission(u,
-                                      Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-                          } catch (Exception e) {
-                          }
-                          Backup.p(this).edit().putString("doc", u.toString()).apply();
-                          new Thread(() -> {
-                              Backup.run(MainActivity.this);
-                              runOnUiThread(() -> js("bk()"));
-                          }).start();
-                      } else if (rq == 2) {
-                          InputStream in = getContentResolver().openInputStream(u);
-                          ByteArrayOutputStream o = new ByteArrayOutputStream();
-                          byte[] buf = new byte[8192];
-                          int n;
-                          while ((n = in.read(buf)) > 0) o.write(buf, 0, n);
-                          in.close();
-                          byte[] b = o.toByteArray();
-                          if (b.length < 29 || Vault.file(this).exists()) throw new Exception("bad");
-                          File tmp = new File(getFilesDir(), "vault.tmp");
-                          FileOutputStream fo = new FileOutputStream(tmp);
-                          fo.write(b);
-                          fo.close();
-                          tmp.renameTo(Vault.file(this));
-                          js("showLock();toast('Sauvegarde restaurée : entre tes identifiants')");
-                      }
-                  } catch (Exception e) {
-                      js("toast('Échec')");
-                  }
-              }
-
-              @Override
               protected void onStop() {
                   super.onStop();
-                  if (!busy) {
-                      Vault.lock();
-                      js("lockUI()");
-                  }
+                  Vault.lock();
+                  js("lockUI()");
               }
 
               @Override
@@ -400,7 +286,7 @@ jobs:
               static byte[] salt;
               static String q = "";
               static String json;
-              static boolean gate;
+              static String pin;
               static boolean legacy;
 
               static File file(Context c) {
@@ -487,75 +373,12 @@ jobs:
               static void lock() {
                   key = null;
                   json = null;
-                  gate = false;
+                  pin = null;
                   legacy = false;
               }
           }
           EOF_4
-          cat > app/src/main/java/com/coffre/app/Backup.java <<'EOF_5'
-          package com.coffre.app;
-
-          import android.content.Context;
-          import android.content.SharedPreferences;
-          import android.database.Cursor;
-          import android.net.Uri;
-          import android.os.Build;
-          import android.provider.OpenableColumns;
-          import java.io.OutputStream;
-          import java.nio.file.Files;
-
-          public class Backup {
-              static SharedPreferences p(Context c) {
-                  return c.getSharedPreferences("b", 0);
-              }
-
-              static String dev() {
-                  return (Build.MANUFACTURER + " " + Build.MODEL).trim();
-              }
-
-              static String fname() {
-                  return "coffre-" + dev().replaceAll("[^A-Za-z0-9]+", "-") + ".bin";
-              }
-
-              static String name(Context c, Uri u) {
-                  try (Cursor q = c.getContentResolver().query(u, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
-                      if (q != null && q.moveToFirst()) return q.getString(0);
-                  } catch (Exception e) {
-                  }
-                  return "fichier choisi";
-              }
-
-              static String info(Context c) {
-                  SharedPreferences s = p(c);
-                  String d = s.getString("doc", null);
-                  String f = d == null ? "" : name(c, Uri.parse(d));
-                  return "{\"d\":\"" + dev().replace("\"", "") + "\",\"f\":\"" + f.replace("\\", "").replace("\"", "")
-                          + "\",\"t\":" + s.getLong("t", 0) + "}";
-              }
-
-              static boolean run(Context c) {
-                  try {
-                      String d = p(c).getString("doc", null);
-                      if (d == null) return false;
-                      byte[] b = Files.readAllBytes(Vault.file(c).toPath());
-                      Uri u = Uri.parse(d);
-                      OutputStream o;
-                      try {
-                          o = c.getContentResolver().openOutputStream(u, "wt");
-                      } catch (Exception e) {
-                          o = c.getContentResolver().openOutputStream(u, "w");
-                      }
-                      o.write(b);
-                      o.close();
-                      p(c).edit().putLong("t", System.currentTimeMillis()).apply();
-                      return true;
-                  } catch (Exception e) {
-                      return false;
-                  }
-              }
-          }
-          EOF_5
-          cat > app/src/main/java/com/coffre/app/Sync.java <<'EOF_6'
+          cat > app/src/main/java/com/coffre/app/Sync.java <<'EOF_5'
           package com.coffre.app;
 
           import android.content.Context;
@@ -568,30 +391,40 @@ jobs:
           import java.io.OutputStream;
           import java.net.HttpURLConnection;
           import java.net.URL;
+          import java.net.URLEncoder;
           import java.nio.file.Files;
+          import javax.crypto.SecretKeyFactory;
+          import javax.crypto.spec.PBEKeySpec;
           import org.json.JSONArray;
           import org.json.JSONObject;
 
           public class Sync {
-              static final String SB_URL = "https://vklcgzwzxbwpjleepsdy.supabase.co";
-              static final String SB_KEY = "sb_publishable_o-DQCrukTQW6H55usOIJyQ_Qy7R9l2z";
+              static final String KEY = "AIzaSyDtFcETvYya_bIZnThFqPZm39Kvi5hLcx0";
+              static final String PROJ = "goudou-9127b";
+              static final String REF = "https://goudou-9127b.firebaseapp.com/";
+              static final String DOC = "projects/" + PROJ + "/databases/(default)/documents";
+              static final String API = "https://firestore.googleapis.com/v1/";
 
               static SharedPreferences p(Context c) {
-                  return c.getSharedPreferences("s", 0);
+                  return c.getSharedPreferences("fb", 0);
               }
 
               static void st(Context c, String s) {
                   p(c).edit().putString("st", s).apply();
               }
 
-              static String[] http(String method, String path, String bearer, String body) throws Exception {
-                  HttpURLConnection c = (HttpURLConnection) new URL(SB_URL + path).openConnection();
+              static long now() {
+                  return System.currentTimeMillis() / 1000;
+              }
+
+              static String[] http(String method, String url, String bearer, String body, String ctype) throws Exception {
+                  HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
                   c.setRequestMethod(method);
                   c.setConnectTimeout(15000);
                   c.setReadTimeout(30000);
-                  c.setRequestProperty("apikey", SB_KEY);
+                  c.setRequestProperty("Referer", REF);
+                  c.setRequestProperty("Content-Type", ctype);
                   if (bearer != null) c.setRequestProperty("Authorization", "Bearer " + bearer);
-                  c.setRequestProperty("Content-Type", "application/json");
                   if (body != null) {
                       c.setDoOutput(true);
                       OutputStream o = c.getOutputStream();
@@ -610,28 +443,66 @@ jobs:
                   return new String[]{String.valueOf(code), bo.toString("UTF-8")};
               }
 
-              static void save(Context c, JSONObject j, String email) throws Exception {
-                  SharedPreferences.Editor e = p(c).edit();
-                  e.putString("at", j.getString("access_token"));
-                  e.putString("rt", j.getString("refresh_token"));
-                  e.putLong("exp", System.currentTimeMillis() / 1000 + j.optLong("expires_in", 3600));
-                  if (email != null) e.putString("em", email);
-                  e.apply();
+              static String authPw(String email, String pw) throws Exception {
+                  SecretKeyFactory f = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+                  byte[] salt = ("coffre-auth|" + email.toLowerCase()).getBytes("UTF-8");
+                  byte[] k = f.generateSecret(new PBEKeySpec(pw.toCharArray(), salt, 200000, 256)).getEncoded();
+                  return Base64.encodeToString(k, Base64.NO_WRAP);
+              }
+
+              static String fr(String m) {
+                  String k = m.split("[ :]")[0];
+                  switch (k) {
+                      case "EMAIL_EXISTS":
+                          return "Cet e-mail a déjà un compte : connecte-toi.";
+                      case "INVALID_LOGIN_CREDENTIALS":
+                      case "INVALID_PASSWORD":
+                      case "EMAIL_NOT_FOUND":
+                          return "E-mail ou mot de passe incorrect.";
+                      case "INVALID_EMAIL":
+                          return "Adresse e-mail invalide.";
+                      case "OPERATION_NOT_ALLOWED":
+                          return "Active la connexion E-mail/Mot de passe dans Firebase (Authentication).";
+                      case "TOO_MANY_ATTEMPTS_TRY_LATER":
+                          return "Trop d'essais : réessaie dans quelques minutes.";
+                      default:
+                          return m.isEmpty() ? "Échec de la connexion" : m;
+                  }
+              }
+
+              static String errMsg(String[] r) {
+                  try {
+                      JSONObject e = new JSONObject(r[1]).getJSONObject("error");
+                      String m = e.optString("message", "");
+                      String s = e.optString("status", "");
+                      if (s.equals("PERMISSION_DENIED") || m.contains("insufficient permissions")) {
+                          return "Accès refusé : publie les règles Firestore.";
+                      }
+                      return m.isEmpty() ? "Serveur " + r[0] : m;
+                  } catch (Exception x) {
+                      return "Serveur " + r[0];
+                  }
               }
 
               static String login(Context c, String mode, String email, String pw) {
-                  if (SB_URL.startsWith("__")) return "ERR:Serveur non configuré";
                   try {
-                      JSONObject b = new JSONObject().put("email", email).put("password", pw);
-                      String path = mode.equals("up") ? "/auth/v1/signup" : "/auth/v1/token?grant_type=password";
-                      String[] r = http("POST", path, null, b.toString());
+                      String url = "https://identitytoolkit.googleapis.com/v1/accounts:"
+                              + (mode.equals("up") ? "signUp" : "signInWithPassword") + "?key=" + KEY;
+                      JSONObject b = new JSONObject().put("email", email).put("password", authPw(email, pw))
+                              .put("returnSecureToken", true);
+                      String[] r = http("POST", url, null, b.toString(), "application/json");
                       JSONObject j = new JSONObject(r[1]);
-                      if (!j.has("access_token")) {
-                          if (r[0].startsWith("2")) return "ERR:Confirmation d'e-mail activée dans Supabase : désactive-la";
-                          return "ERR:" + j.optString("msg", j.optString("error_description", j.optString("message", "Échec")));
+                      if (!j.has("idToken")) {
+                          JSONObject e = j.optJSONObject("error");
+                          return "ERR:" + fr(e == null ? "" : e.optString("message", ""));
                       }
-                      p(c).edit().clear().apply();
-                      save(c, j, email);
+                      p(c).edit().clear()
+                              .putString("at", j.getString("idToken"))
+                              .putString("rt", j.getString("refreshToken"))
+                              .putLong("exp", now() + Long.parseLong(j.optString("expiresIn", "3600")))
+                              .putString("uid", j.getString("localId"))
+                              .putString("em", email)
+                              .apply();
                       return "OK";
                   } catch (Exception e) {
                       return "ERR:Réseau indisponible";
@@ -642,14 +513,16 @@ jobs:
                   SharedPreferences s = p(c);
                   String at = s.getString("at", null);
                   if (at == null) return null;
-                  if (s.getLong("exp", 0) > System.currentTimeMillis() / 1000 + 60) return at;
+                  if (s.getLong("exp", 0) > now() + 60) return at;
                   try {
-                      JSONObject b = new JSONObject().put("refresh_token", s.getString("rt", ""));
-                      String[] r = http("POST", "/auth/v1/token?grant_type=refresh_token", null, b.toString());
+                      String body = "grant_type=refresh_token&refresh_token=" + URLEncoder.encode(s.getString("rt", ""), "UTF-8");
+                      String[] r = http("POST", "https://securetoken.googleapis.com/v1/token?key=" + KEY, null, body,
+                              "application/x-www-form-urlencoded");
                       JSONObject j = new JSONObject(r[1]);
-                      if (!j.has("access_token")) return null;
-                      save(c, j, null);
-                      return j.getString("access_token");
+                      if (!j.has("id_token")) return null;
+                      p(c).edit().putString("at", j.getString("id_token")).putString("rt", j.getString("refresh_token"))
+                              .putLong("exp", now() + Long.parseLong(j.optString("expires_in", "3600"))).apply();
+                      return j.getString("id_token");
                   } catch (Exception e) {
                       return null;
                   }
@@ -658,26 +531,34 @@ jobs:
               static synchronized String push(Context c, boolean force) {
                   try {
                       String t = token(c);
-                      if (t == null) return "ERR:Non connecté, reconnecte-toi";
-                      int prev = p(c).getInt("rev", 0);
-                      if (force) {
-                          String[] g = http("GET", "/rest/v1/vaults?select=rev", t, null);
-                          JSONArray a = new JSONArray(g[1]);
-                          prev = a.length() == 0 ? 0 : a.getJSONObject(0).getInt("rev");
-                      }
+                      String uid = p(c).getString("uid", null);
+                      if (t == null || uid == null) return "ERR:Non connecté, reconnecte-toi";
                       byte[] b = Files.readAllBytes(Vault.file(c).toPath());
-                      JSONObject body = new JSONObject()
-                              .put("p_blob", Base64.encodeToString(b, Base64.NO_WRAP))
-                              .put("p_prev", prev);
-                      String[] r = http("POST", "/rest/v1/rpc/push_vault", t, body.toString());
-                      if (!r[0].startsWith("2")) return "ERR:Serveur " + r[0];
-                      int n = Integer.parseInt(r[1].trim());
-                      if (n < 0) {
+                      JSONObject up = new JSONObject();
+                      up.put("name", DOC + "/vaults/" + uid);
+                      up.put("fields", new JSONObject().put("blob",
+                              new JSONObject().put("stringValue", Base64.encodeToString(b, Base64.NO_WRAP))));
+                      JSONObject w = new JSONObject();
+                      w.put("update", up);
+                      w.put("updateMask", new JSONObject().put("fieldPaths", new JSONArray().put("blob")));
+                      if (!force) {
+                          String ut = p(c).getString("ut", null);
+                          w.put("currentDocument", ut == null ? new JSONObject().put("exists", false)
+                                  : new JSONObject().put("updateTime", ut));
+                      }
+                      JSONObject body = new JSONObject().put("writes", new JSONArray().put(w));
+                      String[] r = http("POST", API + DOC + ":commit", t, body.toString(), "application/json");
+                      if (r[0].startsWith("2")) {
+                          String ut = new JSONObject(r[1]).getJSONArray("writeResults").getJSONObject(0).getString("updateTime");
+                          p(c).edit().putString("ut", ut).putLong("ok", System.currentTimeMillis()).putString("st", "ok").apply();
+                          return "OK";
+                      }
+                      if (r[0].equals("409") || r[1].contains("FAILED_PRECONDITION") || r[1].contains("ALREADY_EXISTS")
+                              || r[1].contains("ABORTED")) {
                           st(c, "conflit");
                           return "CONFLICT";
                       }
-                      p(c).edit().putInt("rev", n).putLong("ok", System.currentTimeMillis()).putString("st", "ok").apply();
-                      return "OK";
+                      return "ERR:" + errMsg(r);
                   } catch (Exception e) {
                       st(c, "off");
                       return "ERR:Réseau indisponible";
@@ -687,20 +568,22 @@ jobs:
               static synchronized String pull(Context c, boolean force) {
                   try {
                       String t = token(c);
-                      if (t == null) return "ERR:Non connecté, reconnecte-toi";
+                      String uid = p(c).getString("uid", null);
+                      if (t == null || uid == null) return "ERR:Non connecté, reconnecte-toi";
                       if (!force && Vault.file(c).exists()) return "ERR:Un coffre existe déjà sur ce téléphone";
-                      String[] r = http("GET", "/rest/v1/vaults?select=blob,rev", t, null);
-                      if (!r[0].startsWith("2")) return "ERR:Serveur " + r[0];
-                      JSONArray a = new JSONArray(r[1]);
-                      if (a.length() == 0) return "EMPTY";
-                      byte[] b = Base64.decode(a.getJSONObject(0).getString("blob"), Base64.DEFAULT);
+                      String[] r = http("GET", API + DOC + "/vaults/" + uid, t, null, "application/json");
+                      if (r[0].equals("404")) return "EMPTY";
+                      if (!r[0].startsWith("2")) return "ERR:" + errMsg(r);
+                      JSONObject d = new JSONObject(r[1]);
+                      String blob = d.getJSONObject("fields").getJSONObject("blob").getString("stringValue");
+                      byte[] b = Base64.decode(blob, Base64.DEFAULT);
                       if (b.length < 29) return "ERR:Données invalides";
                       File tmp = new File(c.getFilesDir(), "vault.tmp");
                       FileOutputStream fo = new FileOutputStream(tmp);
                       fo.write(b);
                       fo.close();
                       if (!tmp.renameTo(Vault.file(c))) return "ERR:Écriture impossible";
-                      p(c).edit().putInt("rev", a.getJSONObject(0).getInt("rev"))
+                      p(c).edit().putString("ut", d.getString("updateTime"))
                               .putLong("ok", System.currentTimeMillis()).putString("st", "ok").apply();
                       return "OK";
                   } catch (Exception e) {
@@ -713,6 +596,17 @@ jobs:
                   new Thread(() -> push(c, false)).start();
               }
 
+              static String logout(Context c) {
+                  boolean linked = p(c).getString("at", null) != null;
+                  if (linked && Vault.file(c).exists() && !"ok".equals(p(c).getString("st", ""))) {
+                      return "ERR:Synchronise d'abord : des changements ne sont pas encore envoyés";
+                  }
+                  Vault.file(c).delete();
+                  p(c).edit().clear().apply();
+                  Vault.lock();
+                  return "OK";
+              }
+
               static String info(Context c) {
                   SharedPreferences s = p(c);
                   try {
@@ -723,8 +617,8 @@ jobs:
                   }
               }
           }
-          EOF_6
-          cat > app/src/main/assets/index.html <<'EOF_7'
+          EOF_5
+          cat > app/src/main/assets/index.html <<'EOF_6'
           <!DOCTYPE html>
           <html lang="fr">
           <head>
@@ -732,289 +626,357 @@ jobs:
           <meta name="viewport" content="width=device-width, initial-scale=1">
           <title>Coffre</title>
           <style>
-          :root{--bg:#0E1620;--sf:#16222F;--ln:#25364A;--ink:#E8EEF4;--mu:#8FA3B5;--br:#D4A84B;--rd:#E5676B;color-scheme:dark}
-          *{box-sizing:border-box}
+          :root{--bg:#0B1320;--sf:#142234;--sf2:#1A2B40;--ln:#243752;--ink:#EAF0F7;--mu:#8CA1B8;--br:#D9AE4E;--ok:#3FCF8E;--wn:#F0B24A;--rd:#F06A6F;color-scheme:dark}
+          *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
           html,body{height:100%;margin:0}
-          body{background:var(--bg);color:var(--ink);font:16px/1.4 system-ui,sans-serif;overflow:hidden}
+          body{background:radial-gradient(900px 520px at 50% -8%,#1c3354 0%,var(--bg) 62%) fixed;color:var(--ink);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden}
           button,input,textarea{font:inherit;color:inherit}
-          input,textarea{width:100%;background:var(--sf);border:1px solid var(--ln);border-radius:8px;padding:12px}
-          input:focus,textarea:focus{outline:2px solid var(--br);outline-offset:-1px}
-          input[type=range]{padding:0}
-          .btn{border:0;border-radius:8px;padding:13px;background:var(--br);color:#1a1405;font-weight:700}
-          .btn.g{background:var(--sf);color:var(--ink);border:1px solid var(--ln)}
-          .btn.r{background:none;color:var(--rd);border:1px solid var(--rd)}
-          #lock{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:24px}
-          .box{width:100%;max-width:340px;display:flex;flex-direction:column;gap:10px}
-          #dial{width:150px;height:150px;transition:transform .6s cubic-bezier(.5,0,.2,1)}
+          button{cursor:pointer}
+          i{display:inline-flex;font-style:normal}
+          h1{margin:6px 0 0;font-size:30px;letter-spacing:-.02em}
+          h2{margin:0 0 4px;font-size:20px;letter-spacing:-.01em}
+          .tag,.hint{color:var(--mu);font-size:14px;margin:4px 0 0}
+          .hint{margin:0 0 12px}
+          #lock{height:100%;overflow:auto;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:22px;gap:18px}
+          .hero{text-align:center}
+          #dial{width:120px;height:120px;transition:transform .7s cubic-bezier(.5,0,.2,1);filter:drop-shadow(0 8px 24px rgba(217,174,78,.25))}
           #dial.spin{transform:rotate(360deg)}
-          .sh{animation:sh .35s}
-          @keyframes sh{20%,60%{transform:translateX(-8px)}40%,80%{transform:translateX(8px)}}
-          h1{margin:0;font-size:26px;text-align:center}
-          .mu{color:var(--mu);font-size:14px;margin:0;text-align:center}
-          #err{color:var(--rd);min-height:20px;text-align:center;font-size:14px}
+          #dial .tk{transform-origin:100px 100px;animation:rot 45s linear infinite}
+          @keyframes rot{to{transform:rotate(360deg)}}
+          .card{width:100%;max-width:380px;background:linear-gradient(180deg,var(--sf),#111e2f);border:1px solid var(--ln);border-radius:20px;padding:20px;box-shadow:0 20px 50px rgba(0,0,0,.35)}
+          .fade{animation:fd .35s ease}
+          @keyframes fd{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+          .shk{animation:shk .35s}
+          @keyframes shk{20%,60%{transform:translateX(-8px)}40%,80%{transform:translateX(8px)}}
+          .seg{display:flex;background:#0e1a2a;border:1px solid var(--ln);border-radius:12px;padding:4px;margin-bottom:16px}
+          .seg button{flex:1;border:0;background:none;color:var(--mu);padding:10px;border-radius:9px;font-weight:600}
+          .seg button.on{background:var(--sf2);color:var(--ink);box-shadow:0 1px 6px rgba(0,0,0,.3)}
+          .fld{display:flex;align-items:center;background:#0e1a2a;border:1px solid var(--ln);border-radius:12px;margin-bottom:10px;transition:.15s}
+          .fld:focus-within{border-color:var(--br);box-shadow:0 0 0 3px rgba(217,174,78,.15)}
+          .fld>i{padding-left:14px;color:var(--mu)}
+          .fld input{flex:1;min-width:0;background:none;border:0;outline:0;padding:14px 12px}
+          .eye{border:0;background:none;color:var(--mu);padding:10px 12px;display:flex}
+          .btn{width:100%;border:0;border-radius:12px;padding:14px;margin-top:6px;font-weight:700;color:#1a1405;background:linear-gradient(135deg,#EBC66F,#C99A38);box-shadow:0 6px 18px rgba(217,174,78,.25);transition:transform .1s}
+          .btn:active{transform:scale(.98)}
+          .btn.g{background:var(--sf2);color:var(--ink);box-shadow:none;border:1px solid var(--ln)}
+          .btn.r{background:none;color:var(--rd);border:1px solid rgba(240,106,111,.5);box-shadow:none}
+          .btn.ld{color:transparent;pointer-events:none;position:relative}
+          .btn.ld::after{content:"";position:absolute;inset:0;margin:auto;width:20px;height:20px;border:2.5px solid rgba(26,20,5,.3);border-top-color:#1a1405;border-radius:50%;animation:rot .7s linear infinite}
+          .err{color:var(--rd);font-size:14px;min-height:20px;margin:2px 0}
+          .meter{display:flex;gap:6px;margin:2px 0 4px}
+          .meter span{flex:1;height:4px;border-radius:2px;background:var(--ln);transition:.2s}
+          .dots{display:flex;gap:6px;margin-bottom:12px}
+          .dots span{width:26px;height:4px;border-radius:2px;background:var(--ln)}
+          .dots span.on{background:var(--br)}
+          .qcard{background:#0e1a2a;border:1px solid var(--ln);border-left:3px solid var(--br);border-radius:12px;padding:14px;margin-bottom:12px;font-weight:600}
           #app{display:none;flex-direction:column;height:100%}
-          header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--ln)}
-          header b{font-size:20px}
-          .v{flex:1;overflow:auto;padding:14px 16px 90px;display:none}
+          header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px}
+          .brand{display:flex;align-items:center;gap:10px;font-size:20px;font-weight:700}
+          .brand i{color:var(--br)}
+          .hr{display:flex;align-items:center;gap:8px}
+          .ibtn{border:1px solid var(--ln);background:var(--sf);color:var(--ink);border-radius:12px;width:42px;height:42px;display:grid;place-items:center}
+          .pill{border:1px solid var(--ln);background:var(--sf);border-radius:20px;padding:8px 12px;font-size:13px;display:flex;align-items:center;gap:7px;color:var(--mu)}
+          .pill .dot{width:8px;height:8px;border-radius:50%;background:currentColor}
+          .pill.ok{color:var(--ok)}
+          .pill.wn{color:var(--wn)}
+          .v{flex:1;overflow:auto;padding:4px 16px 110px;display:none}
           .v.on{display:block}
-          .it{display:flex;width:100%;align-items:center;gap:12px;padding:10px 0;border:0;border-bottom:1px solid var(--ln);background:none;text-align:left}
-          .bd{flex:none;width:40px;height:40px;border-radius:50%;background:var(--sf);border:1px solid var(--br);color:var(--br);display:grid;place-items:center;font-weight:700}
-          .it small{display:block;color:var(--mu)}
-          .fab{position:fixed;right:18px;bottom:78px;width:56px;height:56px;border-radius:50%;border:0;background:var(--br);color:#1a1405;font-size:30px;line-height:1}
-          nav{display:flex;border-top:1px solid var(--ln);background:var(--sf)}
-          nav button{flex:1;border:0;background:none;color:var(--mu);padding:14px 0;font-weight:600}
-          nav button.on{color:var(--br);box-shadow:inset 0 3px 0 var(--br)}
-          #sheet{position:fixed;inset:0;background:var(--bg);overflow:auto;padding:16px;display:none;z-index:5}
-          #sheet.on{display:block}
-          label{display:block;color:var(--mu);font-size:13px;margin:12px 0 4px}
-          .rw{display:flex;gap:6px;align-items:center}
-          .rw input{flex:1;min-width:0;width:auto}
-          .rw .btn{flex:none;padding:12px}
-          #out{font:600 20px/1.4 ui-monospace,monospace;word-break:break-all;background:var(--sf);border:1px solid var(--ln);border-radius:8px;padding:14px;margin:0 0 10px;min-height:60px}
-          .chk{display:flex;align-items:center;gap:10px;color:var(--ink);font-size:16px}
-          .chk input{width:auto}
-          #toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:var(--ink);color:#0E1620;padding:8px 14px;border-radius:20px;display:none;z-index:9}
-          .empty{color:var(--mu);text-align:center;margin-top:40px}
+          .chips{display:flex;gap:8px;margin:2px 0 10px;overflow:auto}
+          .chips button{flex:none;border:1px solid var(--ln);background:var(--sf);color:var(--mu);border-radius:20px;padding:7px 14px;font-size:14px}
+          .chips button.on{background:rgba(217,174,78,.15);border-color:var(--br);color:var(--br)}
+          .it{display:flex;align-items:center;gap:12px;background:var(--sf);border:1px solid var(--ln);border-radius:16px;padding:12px;margin-bottom:10px;animation:fd .35s both}
+          .it:active{background:var(--sf2)}
+          .av{flex:none;width:44px;height:44px;border-radius:14px;display:grid;place-items:center;font-weight:700;font-size:18px;color:#101a28}
+          .av.big{width:64px;height:64px;font-size:26px;border-radius:20px;margin:6px auto 14px}
+          .it .tx{flex:1;min-width:0}
+          .it b,.it small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+          .it small{color:var(--mu)}
+          .empty{text-align:center;color:var(--mu);padding:36px 20px}
+          .empty i{color:var(--br);opacity:.8;margin-bottom:10px}
+          .fab{position:fixed;right:18px;bottom:84px;width:58px;height:58px;border-radius:50%;border:0;color:#1a1405;background:linear-gradient(135deg,#EBC66F,#C99A38);box-shadow:0 10px 26px rgba(217,174,78,.35);display:grid;place-items:center}
+          nav{display:flex;background:rgba(16,28,44,.96);border-top:1px solid var(--ln)}
+          nav button{flex:1;border:0;background:none;color:var(--mu);padding:10px 0 12px;display:flex;flex-direction:column;align-items:center;gap:3px;font-size:12px;font-weight:600}
+          nav button.on{color:var(--br)}
+          #sheet{position:fixed;inset:0;background:var(--bg);overflow:auto;display:none;z-index:5}
+          #sheet.on{display:block;animation:fd .25s}
+          .sh-in{max-width:480px;margin:0 auto;padding:14px 16px 40px}
+          .sh-h{display:flex;align-items:center;justify-content:space-between;font-size:18px}
+          .lb{display:block;color:var(--mu);font-size:13px;margin:12px 4px 6px}
+          textarea{width:100%;background:#0e1a2a;border:1px solid var(--ln);border-radius:12px;padding:14px;resize:none;outline:0}
+          textarea:focus{border-color:var(--br)}
+          .cx{background:var(--sf);border:1px solid var(--ln);border-radius:16px;padding:16px;margin-bottom:12px}
+          .cx h3{margin:0 0 6px;font-size:16px}
+          .prof{display:flex;align-items:center;gap:14px}
+          .prof b{display:block;word-break:break-all}
+          #toast{position:fixed;left:50%;bottom:92px;transform:translateX(-50%);background:var(--ink);color:#0B1320;padding:10px 16px;border-radius:22px;display:none;z-index:9;font-weight:600;max-width:90%;text-align:center}
           </style>
           </head>
           <body>
           <div id="lock">
-          <svg id="dial" viewBox="0 0 200 200"><circle cx="100" cy="100" r="92" fill="none" stroke="#D4A84B" stroke-width="4"/><g id="dt" stroke="#D4A84B" stroke-linecap="round"></g><circle cx="100" cy="100" r="58" fill="#16222F" stroke="#25364A" stroke-width="3"/><circle cx="100" cy="100" r="12" fill="#D4A84B"/><path d="M100 36L94 48H106Z" fill="#E8EEF4"/></svg>
-          <div class="box" id="box">
+          <div class="hero">
+          <svg id="dial" viewBox="0 0 200 200"><circle cx="100" cy="100" r="92" fill="none" stroke="#D9AE4E" stroke-width="4"/><g class="tk" id="dt" stroke="#D9AE4E" stroke-linecap="round"></g><circle cx="100" cy="100" r="58" fill="#142234" stroke="#243752" stroke-width="3"/><circle cx="100" cy="100" r="12" fill="#D9AE4E"/><path d="M100 36L94 48H106Z" fill="#EAF0F7"/></svg>
           <h1>Coffre</h1>
-          <p class="mu" id="stp" style="color:var(--br);font-weight:700"></p>
-          <p class="mu" id="msg"></p>
-          <input id="i1" autocomplete="off">
-          <input id="i2" type="password" autocomplete="off">
-          <div class="mu" id="note"></div>
-          <div id="err"></div>
-          <button class="btn" id="go"></button>
-          <button class="btn g" id="rs">Restaurer une sauvegarde</button>
-          <button class="btn g" id="ra">Se connecter à mon compte</button>
+          <p class="tag">Tes mots de passe, chiffrés et synchronisés.</p>
+          </div>
+          <div class="card" id="box">
+          <div id="sAuth">
+          <div class="seg"><button id="tIn" class="on">Connexion</button><button id="tUp">Inscription</button></div>
+          <div class="fld"><i data-i="mail"></i><input id="em" type="email" placeholder="Adresse e-mail" autocomplete="off"></div>
+          <div class="fld"><i data-i="lock"></i><input id="pw" type="password" placeholder="Mot de passe" autocomplete="off"><button class="eye" data-t="pw"><i data-i="eye"></i></button></div>
+          <div id="up2" style="display:none">
+          <div class="fld"><i data-i="lock"></i><input id="pw2" type="password" placeholder="Confirmer le mot de passe" autocomplete="off"></div>
+          <div class="meter"><span></span><span></span><span></span><span></span></div>
+          <p class="hint" id="mt">8 caractères minimum, plus c'est long, mieux c'est.</p>
+          </div>
+          <div class="err" id="errA"></div>
+          <button class="btn" id="goA">Se connecter</button>
+          </div>
+          <div id="sQ" style="display:none">
+          <div class="dots"><span class="on"></span><span class="on"></span></div>
+          <h2>Ta question secrète</h2>
+          <p class="hint">Elle te sera demandée à chaque ouverture, avec ton mot de passe. Choisis une réponse que toi seul connais.</p>
+          <div class="fld"><i data-i="key"></i><input id="qq" type="text" placeholder="Ta question" autocomplete="off"></div>
+          <div class="fld"><i data-i="shield"></i><input id="qa" type="password" placeholder="Ta réponse" autocomplete="off"></div>
+          <div class="err" id="errQ"></div>
+          <button class="btn" id="goQ">Créer mon coffre</button>
+          <button class="btn g" id="bkQ">Retour</button>
+          </div>
+          <div id="sU" style="display:none">
+          <div class="dots"><span id="d1" class="on"></span><span id="d2"></span></div>
+          <h2 id="uh">Content de te revoir</h2>
+          <div id="u1"><p class="hint">Entre ton mot de passe.</p>
+          <div class="fld"><i data-i="lock"></i><input id="up" type="password" placeholder="Mot de passe" autocomplete="off"><button class="eye" data-t="up"><i data-i="eye"></i></button></div></div>
+          <div id="u2" style="display:none"><div class="qcard" id="uq"></div>
+          <div class="fld"><i data-i="shield"></i><input id="ua" type="password" placeholder="Ta réponse" autocomplete="off"></div></div>
+          <div class="err" id="errU"></div>
+          <button class="btn" id="goU">Continuer</button>
+          </div>
           </div>
           </div>
           <div id="app">
-          <header><b>Coffre</b><button class="btn g" id="lk">Verrouiller</button></header>
-          <div id="v0" class="v on"><input id="q" placeholder="Rechercher" autocomplete="off"><div id="list"></div><button class="fab" id="add" aria-label="Ajouter">+</button></div>
+          <header><div class="brand"><i data-i="vault" data-s="24"></i>Coffre</div><div class="hr"><button id="pill" class="pill">…</button><button id="lk" class="ibtn" aria-label="Verrouiller"><i data-i="lock"></i></button></div></header>
+          <div id="v0" class="v on">
+          <div class="fld"><i data-i="search"></i><input id="q" placeholder="Rechercher dans le coffre" autocomplete="off"></div>
+          <div class="chips" id="chips"><button class="on" data-f="all">Tous</button><button data-f="pw">Mots de passe</button><button data-f="note">Notes</button></div>
+          <div id="list"></div>
+          <button class="fab" id="add" aria-label="Ajouter"><i data-i="plus" data-s="26"></i></button>
+          </div>
           <div id="v1" class="v">
-          <div id="out"></div>
-          <div class="rw"><button class="btn" id="gn" style="flex:1">Générer</button><button class="btn g" id="co" style="flex:1">Copier</button></div>
-          <label>Longueur : <b id="ln">20</b></label><input id="len" type="range" min="8" max="40" value="20">
-          <label class="chk"><input id="up" type="checkbox" checked> Majuscules</label>
-          <label class="chk"><input id="dg" type="checkbox" checked> Chiffres</label>
-          <label class="chk"><input id="sy" type="checkbox" checked> Symboles</label>
+          <div class="cx prof"><div class="av" id="pav">?</div><div><b id="pe">Non connecté</b><span class="hint" id="ps" style="display:block;margin:2px 0 0"></span></div></div>
+          <div class="cx" id="al"><h3>Relier à un compte</h3><p class="hint">Retrouve ton coffre sur n'importe quel téléphone. Ton mot de passe du coffre sert aussi de mot de passe de connexion.</p>
+          <div class="fld"><i data-i="mail"></i><input id="le" type="email" placeholder="Adresse e-mail" autocomplete="off"></div>
+          <button class="btn" id="lu">S'inscrire</button><button class="btn g" id="li">Se connecter</button></div>
+          <div class="cx" id="ao"><h3>Synchronisation</h3>
+          <button class="btn" id="sy2">Synchroniser maintenant</button>
+          <button class="btn g" id="pf">Écraser le compte avec ce coffre</button>
+          <button class="btn g" id="pl">Remplacer ce coffre par celui du compte</button>
+          <button class="btn r" id="lo">Se déconnecter</button></div>
+          <div class="cx"><h3>Sécurité</h3><p class="hint" style="margin:0 0 8px">Chiffrement AES-256. Le coffre est chiffré sur ton téléphone avant tout envoi : le serveur ne voit jamais tes données ni ton mot de passe.</p>
+          <button class="btn g" id="lk2">Verrouiller maintenant</button></div>
           </div>
-          <div id="v2" class="v">
-          <p class="mu" style="text-align:left">Appareil détecté : <b id="dv"></b></p>
-          <label>Sauvegarde automatique</label>
-          <div id="bs" class="mu" style="text-align:left;white-space:pre-line;margin-bottom:10px"></div>
-          <button class="btn" id="bf" style="width:100%">Choisir où sauvegarder</button>
-          <button class="btn g" id="bn" style="width:100%;margin-top:8px">Sauvegarder maintenant</button>
-          <p class="mu" style="text-align:left;margin-top:14px">La sauvegarde est chiffrée avec ton code. Au choix : Google Drive, si Android te le permet, ou le stockage du téléphone. Le fichier est mis à jour après chaque modification.</p>
-          <div id="acc">
-          <label style="margin-top:22px">Compte en ligne</label>
-          <div id="as" class="mu" style="text-align:left;white-space:pre-line;margin-bottom:10px"></div>
-          <div id="al">
-          <input id="ae" type="text" placeholder="E-mail" autocomplete="off" style="margin-bottom:8px">
-          <input id="ap" type="password" placeholder="Mot de passe du compte" autocomplete="off">
-          <div class="rw" style="margin-top:8px"><button class="btn" id="au" style="flex:1">Créer le compte</button><button class="btn g" id="ai" style="flex:1">Se connecter</button></div>
+          <nav><button id="n0" class="on"><i data-i="vault"></i><span>Coffre</span></button><button id="n1"><i data-i="user"></i><span>Compte</span></button></nav>
           </div>
-          <div id="ao" style="display:none">
-          <button class="btn" id="sy2" style="width:100%">Synchroniser maintenant</button>
-          <button class="btn g" id="pf" style="width:100%;margin-top:8px">Écraser le compte avec ce coffre</button>
-          <button class="btn g" id="pl" style="width:100%;margin-top:8px">Remplacer ce coffre par celui du compte</button>
-          <button class="btn g" id="lo" style="width:100%;margin-top:8px">Se déconnecter</button>
-          </div>
-          <p class="mu" style="text-align:left;margin-top:14px">Le compte ne stocke que ton coffre chiffré. Utilise un mot de passe de compte différent de celui du coffre.</p>
-          </div>
-          </div>
-          <nav><button id="n0" class="on">Coffre</button><button id="n1">Générateur</button><button id="n2">Réglages</button></nav>
-          </div>
-          <div id="sheet">
-          <div class="rw" style="justify-content:space-between"><b id="sh_t">Nouvelle entrée</b><button class="btn g" id="cl">Fermer</button></div>
-          <label>Titre</label><input id="f_t" autocomplete="off">
-          <label>Identifiant</label><div class="rw"><input id="f_u" autocomplete="off"><button class="btn g" id="cu">Copier</button></div>
-          <label>Mot de passe</label><div class="rw"><input id="f_p" type="password" autocomplete="off"><button class="btn g" id="sp">Voir</button><button class="btn g" id="cp">Copier</button></div>
-          <button class="btn g" id="gp" style="margin-top:8px;width:100%">Générer un mot de passe</button>
-          <label>Note</label><textarea id="f_n" rows="5"></textarea>
-          <div class="box" style="max-width:none;margin-top:16px"><button class="btn" id="sv">Enregistrer</button><button class="btn r" id="dl">Supprimer</button></div>
-          </div>
+          <div id="sheet"><div class="sh-in">
+          <div class="sh-h"><button class="ibtn" id="cl" aria-label="Retour"><i data-i="back"></i></button><b id="sh_t">Nouvelle entrée</b><span style="width:42px"></span></div>
+          <div class="av big" id="sh_av">?</div>
+          <label class="lb">Titre</label><div class="fld"><input id="f_t" placeholder="Ex. Gmail, Banque, Netflix" autocomplete="off"></div>
+          <label class="lb">Identifiant</label><div class="fld"><input id="f_u" placeholder="E-mail ou nom d'utilisateur" autocomplete="off"><button class="eye" id="cu" aria-label="Copier"><i data-i="copy"></i></button></div>
+          <label class="lb">Mot de passe</label><div class="fld"><input id="f_p" type="password" autocomplete="off"><button class="eye" id="sp" aria-label="Afficher"><i data-i="eye"></i></button><button class="eye" id="gp" aria-label="Générer"><i data-i="spark"></i></button><button class="eye" id="cp" aria-label="Copier"><i data-i="copy"></i></button></div>
+          <label class="lb">Note</label><textarea id="f_n" rows="4" placeholder="Informations supplémentaires"></textarea>
+          <button class="btn" id="sv">Enregistrer</button>
+          <button class="btn r" id="dl">Supprimer</button>
+          </div></div>
           <div id="toast"></div>
           <script>
           const $=id=>document.getElementById(id),A=window.Android;
-          let E=[],cur=null,mode,fails=0,until=0,del=0,tt;
+          const IC={
+          mail:'<path d="M4 6h16v12H4z"/><path d="m4 7 8 6 8-6"/>',
+          lock:'<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+          key:'<circle cx="8" cy="15" r="4"/><path d="m11 12 8-8m-3 3 3 3"/>',
+          eye:'<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+          eyeoff:'<path d="M3 3l18 18"/><path d="M10.6 6.2A9.8 9.8 0 0 1 12 6c6 0 10 6 10 6a17 17 0 0 1-3.2 3.7M6.6 6.7A17 17 0 0 0 2 12s4 7 10 7a9.7 9.7 0 0 0 4.1-.9"/>',
+          copy:'<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/>',
+          search:'<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+          plus:'<path d="M12 5v14M5 12h14"/>',
+          user:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+          vault:'<rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="12" cy="12" r="4"/><path d="M12 8v1M12 15v1M8 12h1M15 12h1"/>',
+          back:'<path d="m15 18-6-6 6-6"/>',
+          spark:'<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>',
+          shield:'<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>'
+          };
+          function ic(n,s){return '<svg viewBox="0 0 24 24" width="'+(s||20)+'" height="'+(s||20)+'" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'+IC[n]+'</svg>'}
+          document.querySelectorAll("[data-i]").forEach(e=>e.innerHTML=ic(e.dataset.i,e.dataset.s));
+          function el(t,c,h){const e=document.createElement(t);if(c)e.className=c;if(h!=null)e.innerHTML=h;return e}
+          let E=[],cur=null,ctx="in",mode="in",P="",Q="",AN="",EM="",fails=0,until=0,flt="all",tt;
           const NS="http://www.w3.org/2000/svg";
           for(let i=0;i<36;i++){const a=i*Math.PI/18,r=i%3?82:77,l=document.createElementNS(NS,"line");l.setAttribute("x1",100+r*Math.sin(a));l.setAttribute("y1",100-r*Math.cos(a));l.setAttribute("x2",100+88*Math.sin(a));l.setAttribute("y2",100-88*Math.cos(a));l.setAttribute("stroke-width",i%9?1.5:3);$("dt").append(l)}
-          function toast(m){const t=$("toast");t.textContent=m;t.style.display="block";clearTimeout(tt);tt=setTimeout(()=>t.style.display="none",1800)}
-          function err(m){$("err").textContent=m}
-          function idle(){$("go").disabled=false}
-          let st,flow,P="",Q="",AN="";
-          function step(s){
-           st=s;err("");$("note").textContent="";$("i1").value="";$("i2").value="";
-           const T={
-            c1:["Étape 1 sur 4","Choisis ton mot de passe : 6 caractères minimum, 8 ou plus conseillés. Impossible de le récupérer si tu l'oublies.","Mot de passe","Confirmer le mot de passe"],
-            c2:["Étape 2 sur 4","Écris une question secrète et sa réponse. Les deux seront demandées à chaque ouverture.","Ta question","Ta réponse"],
-            u1:["Étape 1 sur 4","Entre ton mot de passe.","Mot de passe",""],
-            u2:["Étape 2 sur 4",Q,"Ta réponse",""]
-           }[s];
-           $("stp").textContent=T[0];$("msg").textContent=T[1];
-           $("i1").placeholder=T[2];$("i2").placeholder=T[3];
-           $("i1").type=s=="c2"?"text":"password";
-           $("i1").style.display="block";$("i2").style.display=T[3]?"block":"none";
-           $("go").textContent="Continuer";$("go").style.display="block";idle();
-          }
-          function shake(){const b=$("box");b.classList.remove("sh");void b.offsetWidth;b.classList.add("sh")}
+          const PAL=["#D9AE4E","#4FA3E0","#3FCF8E","#B07CF0","#F0806A","#4FD1D9"];
+          function colr(s){let h=0;for(const ch of s)h=(h*31+ch.charCodeAt(0))|0;return PAL[Math.abs(h)%PAL.length]}
+          function toast(m){const t=$("toast");t.textContent=m;t.style.display="block";clearTimeout(tt);tt=setTimeout(()=>t.style.display="none",2200)}
+          function busy(id,on){const b=$(id);b.disabled=on;b.classList.toggle("ld",on)}
+          function err(id,m){$(id).textContent=m||""}
+          function scr(id){["sAuth","sQ","sU"].forEach(k=>$(k).style.display=k==id?"block":"none");const b=$("box");b.classList.remove("fade");void b.offsetWidth;b.classList.add("fade")}
+          function shake(){const b=$("box");b.classList.remove("shk");void b.offsetWidth;b.classList.add("shk")}
+          document.querySelectorAll(".eye[data-t]").forEach(b=>b.onclick=()=>{const i=$(b.dataset.t);i.type=i.type=="password"?"text":"password";b.innerHTML=ic(i.type=="password"?"eye":"eyeoff")});
+          function tabA(m){mode=m;$("tIn").classList.toggle("on",m=="in");$("tUp").classList.toggle("on",m=="up");$("up2").style.display=m=="up"?"block":"none";$("goA").textContent=m=="in"?"Se connecter":"Continuer";err("errA")}
+          $("tIn").onclick=()=>tabA("in");$("tUp").onclick=()=>tabA("up");
+          function strength(p){let s=0;if(p.length>=8)s++;if(p.length>=12)s++;if(/[a-z]/.test(p)&&/[A-Z]/.test(p)&&/\d/.test(p))s++;if(/[^a-zA-Z0-9]/.test(p)&&p.length>=10)s++;return s}
+          $("pw").oninput=()=>{if(mode!="up")return;const s=strength($("pw").value),c=["#243752","#F06A6F","#F0B24A","#3FCF8E","#3FCF8E"][s];document.querySelectorAll(".meter span").forEach((e,i)=>e.style.background=i<s?c:"#243752");$("mt").textContent=["8 caractères minimum, plus c'est long, mieux c'est.","Faible","Moyen","Fort","Excellent"][s]};
           function showLock(){
-           E=[];cur=null;P="";Q="";AN="";$("sheet").classList.remove("on");$("app").style.display="none";$("lock").style.display="flex";
-           const has=!!A&&A.has()===true;flow=has?"unlock":"create";
-           $("rs").style.display=has?"none":"block";$("ra").style.display=has||!(A&&A.cfg())?"none":"block";
-           step(has?"u1":"c1");
+           E=[];cur=null;P="";Q="";AN="";EM="";
+           $("sheet").classList.remove("on");$("app").style.display="none";$("lock").style.display="flex";
+           ["em","pw","pw2","up","ua","qq","qa"].forEach(k=>$(k).value="");
+           busy("goA",false);busy("goQ",false);
+           if(A&&A.has()===true)uStep(1);else{tabA("in");scr("sAuth")}
           }
           function lockUI(){if(A)A.lock();showLock()}
-          function enter(){const d=$("dial");d.classList.add("spin");setTimeout(()=>{d.classList.remove("spin");$("lock").style.display="none";$("app").style.display="flex";tab(0);list();try{if(!JSON.parse(A.info()).f)toast("Pense à activer la sauvegarde (Réglages)")}catch(x){}},650)}
-          function bstep(n){
-           st="b"+n;err("");$("i1").style.display="none";$("i2").style.display="none";
-           $("stp").textContent="Étape "+n+" sur 4";
-           $("msg").textContent=n==3?"Vérification du visage…":"Pose ton doigt sur le capteur d'empreintes.";
-           $("go").textContent="Réessayer";$("go").style.display="none";
-           A.bio(n);
+          function uStep(n){
+           scr("sU");$("u1").style.display=n==1?"block":"none";$("u2").style.display=n==2?"block":"none";
+           $("d2").classList.toggle("on",n==2);$("uh").textContent=n==1?"Content de te revoir":"Question secrète";
+           if(n==2)$("uq").textContent=Q;
+           $("goU").textContent=n==1?"Continuer":"Déverrouiller";err("errU");busy("goU",false);
           }
-          function bioDone(n,ok){
-           if(!ok){err("Vérification annulée ou refusée.");$("go").style.display="block";idle();return}
-           if(n==3){bstep(4);return}
-           finish();
-          }
-          function nextBio(){
-           const c=A.caps();
-           if(c[1]!="1"){step(flow=="unlock"?"u1":"c1");err("Aucune empreinte enregistrée : ajoute-en une dans les réglages du téléphone.");return}
-           if(c[0]=="1")bstep(3);else{bstep(4);$("note").textContent="Visage : indisponible sur ce téléphone (Android ne l'ouvre pas aux apps)."}
-          }
-          function tryUnlock(ans){
-           $("go").disabled=true;$("go").textContent="…";
+          function enter(){const d=$("dial");d.classList.add("spin");setTimeout(()=>{d.classList.remove("spin");$("lock").style.display="none";$("app").style.display="flex";tab(0);list();pill()},700)}
+          $("goU").onclick=()=>{
+           if(!A)return;
+           if(Date.now()<until){err("errU","Attends "+Math.ceil((until-Date.now())/1000)+" s");return}
+           if($("u1").style.display!="none"){
+            const p=$("up").value;if(!p)return;P=p;Q=A.question();
+            if(!Q){err("errU","Ce coffre est dans un ancien format non pris en charge.");return}
+            uStep(2);return;
+           }
+           const a=$("ua").value;if(!a)return;AN=a;busy("goU",true);
            setTimeout(()=>{
-            const r=A.unlock(P,ans);
-            if(r==="OK"){flow="unlock";nextBio();return}
-            if(r==="LEG"){flow="legacy";step("c2");$("msg").textContent="Mise à niveau : ajoute une question secrète et sa réponse.";return}
-            fails++;until=Date.now()+Math.min(fails*2,30)*1000;P="";AN="";
-            step("u1");err("Mot de passe ou réponse incorrect");shake();
+            const r=A.unlock(P,AN);
+            if(r==="OK"){try{E=JSON.parse(A.data()).e||[]}catch(x){E=[]}P="";AN="";fails=0;enter();return}
+            fails++;until=Date.now()+Math.min(fails*2,30)*1000;P="";AN="";$("ua").value="";$("up").value="";
+            uStep(1);err("errU","Mot de passe ou réponse incorrect");shake();
+           },60);
+          };
+          $("goA").onclick=()=>{
+           if(!A){err("errA","Ouvre ce coffre depuis l'application.");return}
+           const e=$("em").value.trim(),p=$("pw").value;
+           if(!/^\S+@\S+\.\S+$/.test(e)){err("errA","Adresse e-mail invalide");return}
+           if(mode=="up"){
+            if(p.length<8){err("errA","8 caractères minimum");return}
+            if(p!==$("pw2").value){err("errA","Les deux mots de passe sont différents");return}
+            EM=e;P=p;ctx="up";err("errQ");scr("sQ");return;
+           }
+           if(!p){err("errA","Entre ton mot de passe");return}
+           EM=e;P=p;ctx="in";err("errA");busy("goA",true);A.acct("in",e,p);
+          };
+          $("goQ").onclick=()=>{
+           const q=$("qq").value.trim(),a=$("qa").value;
+           if(q.length<5||a.trim().length<2){err("errQ","Question (5 caractères min.) et réponse requises");return}
+           Q=q;AN=a;err("errQ");busy("goQ",true);
+           if(ctx=="up")A.acct("up",EM,P);else finishCreate();
+          };
+          $("bkQ").onclick=()=>scr("sAuth");
+          function finishCreate(){
+           setTimeout(()=>{
+            if(A.setup(P,Q,AN)!==true){busy("goQ",false);err("errQ","Création impossible, réessaie");return}
+            E=[];P="";AN="";Q="";busy("goQ",false);enter();
            },60);
           }
-          function finish(){
-           try{
-            if(flow=="unlock"){const d=A.data();if(d==="ERR")throw 0;E=JSON.parse(d).e||[]}
-            else{
-             if(A.setup(P,Q,AN)!==true)throw 0;
-             const d=A.data();E=flow=="legacy"&&d!=="ERR"?(JSON.parse(d).e||[]):[];
+          function sdone(op,r){
+           const bad=r.startsWith("ERR"),m=bad?r.slice(4):"";
+           if(op=="acct"){
+            if(bad){busy("goA",false);busy("goQ",false);if(ctx=="in")err("errA",m);else if(ctx=="up")err("errQ",m);else toast(m);return}
+            if(ctx=="in")A.pull(false);else if(ctx=="up")finishCreate();else A.push(false);
+            return;
+           }
+           if(op=="pull"){
+            if(ctx=="in"){
+             busy("goA",false);
+             if(r=="OK"){Q=A.question();if(!Q){err("errA","Coffre en ligne illisible");return}uStep(2);return}
+             if(r=="EMPTY"){err("errQ");scr("sQ");return}
+             err("errA",m);return;
             }
-           }catch(x){step(flow=="create"?"c1":"u1");err("Erreur : recommence");return}
-           P="";AN="";Q="";fails=0;enter();
+            if(r=="OK"){lockUI();toast("Coffre remplacé : déverrouille-le");return}
+            toast(r=="EMPTY"?"Aucun coffre dans le compte":m);return;
+           }
+           toast(r=="OK"?"Synchronisé":r=="CONFLICT"?"Conflit : récupère ou écrase":m);pill();acv();
           }
-          $("go").onclick=()=>{
-           if(!A){err("Ouvre ce coffre depuis l'application.");return}
-           if(st[0]=="b"){err("");bstep(+st[1]);return}
-           if(st=="a1"){const e=$("i1").value.trim(),w=$("i2").value;if(!e||!w)return;err("");$("go").disabled=true;$("go").textContent="…";A.acct("in",e,w);return}
-           const a=$("i1").value,b=$("i2").value;err("");
-           if(Date.now()<until){err("Attends "+Math.ceil((until-Date.now())/1000)+" s");return}
-           if(st=="c1"){if(a.length<6){err("6 caractères minimum");return}if(a!==b){err("Les deux mots de passe sont différents");return}P=a;step("c2");return}
-           if(st=="c2"){if(a.trim().length<5||b.trim().length<2){err("Question (5 caractères min.) et réponse requises");return}Q=a.trim();AN=b;nextBio();return}
-           if(st=="u1"){if(!a)return;P=a;Q=A.question();if(Q)step("u2");else tryUnlock("");return}
-           if(st=="u2"){if(!a)return;AN=a;tryUnlock(a)}
-          };
-          function tab(i){[0,1,2].forEach(k=>{$("v"+k).classList.toggle("on",k==i);$("n"+k).classList.toggle("on",k==i)});if(i==1&&!$("out").textContent)$("out").textContent=gen();if(i==2){bk();ac()}}
-          $("n0").onclick=()=>tab(0);$("n1").onclick=()=>tab(1);$("n2").onclick=()=>tab(2);$("lk").onclick=lockUI;
+          function tab(i){[0,1].forEach(k=>{$("v"+k).classList.toggle("on",k==i);$("n"+k).classList.toggle("on",k==i)});if(i==1)acv()}
+          $("n0").onclick=()=>tab(0);$("n1").onclick=()=>tab(1);$("lk").onclick=lockUI;$("lk2").onclick=lockUI;$("pill").onclick=()=>tab(1);
+          function pill(){
+           if(!A||$("app").style.display!="flex")return;
+           let i={};try{i=JSON.parse(A.sinfo())}catch(x){}
+           const p=$("pill");
+           if(!i.e){p.className="pill";p.innerHTML='<span class="dot"></span>Non lié';return}
+           const m={ok:["ok","Synchronisé"],conflit:["wn","Conflit"],off:["","Hors ligne"]}[i.st]||["","En attente"];
+           p.className="pill "+m[0];p.innerHTML='<span class="dot"></span>'+m[1];
+          }
+          setInterval(pill,3000);
+          function acv(){
+           let i={};try{i=JSON.parse(A.sinfo())}catch(x){}
+           const on=!!i.e;
+           $("pe").textContent=on?i.e:"Non connecté";$("pav").textContent=on?i.e[0].toUpperCase():"?";$("pav").style.background=on?colr(i.e):"#243752";
+           const S={ok:"Synchronisé",conflit:"Conflit : un autre appareil a modifié le coffre",off:"Hors ligne : renvoi à la prochaine modification"};
+           $("ps").textContent=on?(S[i.st]||"En attente de synchronisation")+(i.ok?" - "+new Date(i.ok).toLocaleString("fr-FR"):""):"Aucun compte relié";
+           $("al").style.display=on?"none":"block";$("ao").style.display=on?"block":"none";
+          }
+          function two(id,txt,fn){const b=$(id);let a=0;b.onclick=()=>{if(a){a=0;b.textContent=txt;fn();return}a=1;b.textContent="Confirmer ?";setTimeout(()=>{a=0;b.textContent=txt},3000)}}
+          function linkAcct(m){const e=$("le").value.trim();if(!/^\S+@\S+\.\S+$/.test(e)){toast("Adresse e-mail invalide");return}ctx="set";toast(m=="up"?"Création du compte…":"Connexion…");A.acct2(m,e)}
+          $("lu").onclick=()=>linkAcct("up");$("li").onclick=()=>linkAcct("in");
+          $("sy2").onclick=()=>{ctx="set";toast("Synchronisation…");A.push(false)};
+          two("pf","Écraser le compte avec ce coffre",()=>{ctx="set";A.push(true)});
+          two("pl","Remplacer ce coffre par celui du compte",()=>{ctx="set";A.pull(true)});
+          two("lo","Se déconnecter",()=>{const r=A.logout();if(r==="OK"){lockUI();toast("Déconnecté")}else toast(r.slice(4))});
+          document.querySelectorAll("#chips button").forEach(b=>b.onclick=()=>{flt=b.dataset.f;document.querySelectorAll("#chips button").forEach(x=>x.classList.toggle("on",x==b));list()});
           function list(){
            const q=$("q").value.toLowerCase(),L=$("list");L.innerHTML="";
-           const f=E.filter(x=>(x.t+" "+x.u).toLowerCase().includes(q)).sort((a,b)=>a.t.localeCompare(b.t));
-           if(!f.length){const p=document.createElement("p");p.className="empty";p.textContent=E.length?"Aucun résultat":"Ton coffre est vide. Touche + pour ajouter un mot de passe ou une note.";L.append(p)}
-           f.forEach(x=>{
-            const b=document.createElement("button"),d=document.createElement("div"),s=document.createElement("span"),m=document.createElement("small");
-            b.className="it";d.className="bd";d.textContent=(x.t[0]||"?").toUpperCase();
-            s.textContent=x.t;m.textContent=x.u||(x.p?"Mot de passe":"Note");s.append(m);
-            b.append(d,s);b.onclick=()=>edit(x);L.append(b);
+           let f=E.filter(x=>(x.t+" "+x.u).toLowerCase().includes(q));
+           if(flt=="pw")f=f.filter(x=>x.p);if(flt=="note")f=f.filter(x=>!x.p);
+           f.sort((a,b)=>a.t.localeCompare(b.t));
+           if(!f.length){
+            const d=el("div","empty",ic("vault",44)+"<p>"+(E.length?"Aucun résultat":"Ton coffre est vide.<br>Touche + pour ajouter ton premier mot de passe ou une note.")+"</p>");L.append(d);return;
+           }
+           f.forEach((x,i)=>{
+            const b=el("div","it"),av=el("div","av",(x.t[0]||"?").toUpperCase()),tx=el("div","tx"),t=el("b"),s=el("small");
+            b.style.animationDelay=Math.min(i*30,300)+"ms";av.style.background=colr(x.t);
+            t.textContent=x.t;s.textContent=x.u||(x.p?"Mot de passe":"Note sécurisée");tx.append(t,s);b.append(av,tx);
+            if(x.p){const c=el("button","eye",ic("copy"));c.setAttribute("aria-label","Copier le mot de passe");c.onclick=ev=>{ev.stopPropagation();A.copy(x.p);toast("Mot de passe copié")};b.append(c)}
+            b.onclick=()=>edit(x);L.append(b);
            });
           }
           $("q").oninput=list;
-          function edit(x){cur=x||null;$("sh_t").textContent=x?"Modifier":"Nouvelle entrée";$("f_t").value=x?x.t:"";$("f_u").value=x?x.u:"";$("f_p").value=x?x.p:"";$("f_p").type="password";$("sp").textContent="Voir";$("f_n").value=x?x.n:"";$("dl").style.display=x?"block":"none";$("sheet").classList.add("on")}
-          $("add").onclick=()=>edit();
-          $("cl").onclick=()=>$("sheet").classList.remove("on");
-          function persist(){if(!A.save(JSON.stringify({e:E})))toast("Échec de l'enregistrement")}
+          function updAv(){const t=$("f_t").value.trim();$("sh_av").textContent=(t[0]||"?").toUpperCase();$("sh_av").style.background=colr(t||"?")}
+          $("f_t").oninput=updAv;
+          function edit(x){cur=x||null;$("sh_t").textContent=x?"Modifier":"Nouvelle entrée";$("f_t").value=x?x.t:"";$("f_u").value=x?x.u:"";$("f_p").value=x?x.p:"";$("f_p").type="password";$("sp").innerHTML=ic("eye");$("f_n").value=x?x.n:"";$("dl").style.display=x?"block":"none";updAv();$("sheet").classList.add("on")}
+          function closeSheet(){$("sheet").classList.remove("on")}
+          $("add").onclick=()=>edit();$("cl").onclick=closeSheet;
+          function persist(){if(!A.save(JSON.stringify({e:E})))toast("Échec de l'enregistrement");setTimeout(pill,1500)}
           $("sv").onclick=()=>{
            const o={t:$("f_t").value.trim(),u:$("f_u").value.trim(),p:$("f_p").value,n:$("f_n").value};
            if(!o.t){toast("Donne un titre");return}
            if(cur)Object.assign(cur,o);else E.push(Object.assign({id:Date.now()},o));
-           persist();$("sheet").classList.remove("on");list();
+           persist();closeSheet();list();toast("Enregistré");
           };
-          $("dl").onclick=()=>{
-           if(del){del=0;E=E.filter(x=>x!==cur);persist();$("sheet").classList.remove("on");list();$("dl").textContent="Supprimer";return}
-           del=1;$("dl").textContent="Confirmer la suppression";setTimeout(()=>{del=0;$("dl").textContent="Supprimer"},3000);
-          };
-          $("sp").onclick=()=>{const p=$("f_p");p.type=p.type=="password"?"text":"password";$("sp").textContent=p.type=="password"?"Voir":"Cacher"};
+          two("dl","Supprimer",()=>{E=E.filter(x=>x!==cur);persist();closeSheet();list()});
+          $("sp").onclick=()=>{const p=$("f_p");p.type=p.type=="password"?"text":"password";$("sp").innerHTML=ic(p.type=="password"?"eye":"eyeoff")};
           $("cu").onclick=()=>{A.copy($("f_u").value);toast("Identifiant copié")};
           $("cp").onclick=()=>{A.copy($("f_p").value);toast("Mot de passe copié")};
-          $("gp").onclick=()=>{$("f_p").value=gen();$("f_p").type="text";$("sp").textContent="Cacher"};
           function gen(){
-           const n=+$("len").value,u=$("up").checked,d=$("dg").checked,y=$("sy").checked;
-           let s="abcdefghijkmnopqrstuvwxyz";if(u)s+="ABCDEFGHJKLMNPQRSTUVWXYZ";if(d)s+="23456789";if(y)s+="!@#$%&*?-_+=";
+           const n=18;let s="abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%&*?-_+=";
            const lim=Math.floor(4294967296/s.length)*s.length,b=new Uint32Array(1);let o;
            do{o=[];while(o.length<n){crypto.getRandomValues(b);if(b[0]<lim)o.push(s[b[0]%s.length])}o=o.join("")}
-           while((u&&!/[A-Z]/.test(o))||(d&&!/[2-9]/.test(o))||(y&&!/[^a-zA-Z0-9]/.test(o)));
+           while(!/[a-z]/.test(o)||!/[A-Z]/.test(o)||!/[2-9]/.test(o)||!/[^a-zA-Z0-9]/.test(o));
            return o;
           }
-          $("gn").onclick=()=>$("out").textContent=gen();
-          $("co").onclick=()=>{A.copy($("out").textContent);toast("Copié")};
-          $("len").oninput=()=>{$("ln").textContent=$("len").value;$("out").textContent=gen()};
-          ["up","dg","sy"].forEach(i=>$(i).onchange=()=>$("out").textContent=gen());
-          function back(){if($("lock").style.display=="flex")return false;if($("sheet").classList.contains("on")){$("sheet").classList.remove("on");return true}if(!$("n0").classList.contains("on")){tab(0);return true}return false}
-          function bk(){
-           if(!A)return;
-           let i={};try{i=JSON.parse(A.info())}catch(x){}
-           $("dv").textContent=i.d||"inconnu";
-           $("bs").textContent=i.f?"Fichier : "+i.f+(i.t?"\nDernière sauvegarde : "+new Date(i.t).toLocaleString("fr-FR"):"\nPas encore de sauvegarde"):"Désactivée : choisis un emplacement pour l'activer.";
+          $("gp").onclick=()=>{$("f_p").value=gen();$("f_p").type="text";$("sp").innerHTML=ic("eyeoff")};
+          function back(){
+           if($("lock").style.display=="flex"){if($("sQ").style.display=="block"){scr("sAuth");return true}return false}
+           if($("sheet").classList.contains("on")){closeSheet();return true}
+           if(!$("n0").classList.contains("on")){tab(0);return true}
+           return false;
           }
-          $("bf").onclick=()=>A.pickFile();
-          $("bn").onclick=()=>{toast(A.backupNow()===true?"Sauvegarde faite":"Échec : choisis un emplacement");bk()};
-          $("rs").onclick=()=>A.restore();
-          let sctx="set";
-          function astep(){st="a1";err("");$("note").textContent="";$("stp").textContent="Compte en ligne";$("msg").textContent="Connecte-toi pour récupérer ton coffre.";$("i1").type="text";$("i1").placeholder="E-mail";$("i2").placeholder="Mot de passe du compte";$("i1").value="";$("i2").value="";$("i1").style.display="block";$("i2").style.display="block";$("go").textContent="Se connecter";$("go").style.display="block";idle()}
-          function lerr(m){idle();$("go").textContent="Se connecter";err(m)}
-          function sdone(op,r){
-           const bad=r.startsWith("ERR"),m=bad?r.slice(4):"";
-           if(op=="acct"){
-            if(bad){if(sctx=="lock")lerr(m);else{toast(m);ac()}return}
-            if(sctx=="lock")A.pull(false);else A.push(false);
-            return;
-           }
-           if(op=="pull"){
-            if(r=="OK"){if(sctx=="lock"){showLock();toast("Coffre récupéré : entre tes identifiants")}else{lockUI();toast("Coffre remplacé : entre tes identifiants")}return}
-            if(r=="EMPTY"){if(sctx=="lock")lerr("Aucun coffre en ligne pour ce compte");else toast("Aucun coffre en ligne");return}
-            if(sctx=="lock")lerr(m);else toast(m);
-            return;
-           }
-           toast(r=="OK"?"Synchronisé":r=="CONFLICT"?"Conflit : récupère ou écrase":m);ac();
-          }
-          function ac(){
-           if(!A)return;
-           const cf=A.cfg();$("acc").style.display=cf?"block":"none";if(!cf)return;
-           let i={};try{i=JSON.parse(A.sinfo())}catch(x){}
-           const on=!!i.e;
-           $("al").style.display=on?"none":"block";$("ao").style.display=on?"block":"none";
-           const S={ok:"À jour",conflit:"Conflit : un autre appareil a modifié le coffre",off:"Hors ligne : renvoi à la prochaine modification"};
-           $("as").textContent=on?"Connecté : "+i.e+"\n"+(S[i.st]||"")+(i.ok?"\nDernière synchro : "+new Date(i.ok).toLocaleString("fr-FR"):""):"Non connecté. Un compte permet de retrouver ton coffre sur un autre téléphone.";
-          }
-          function two(id,txt,fn){const b=$(id);let a=0;b.onclick=()=>{if(a){a=0;b.textContent=txt;fn();return}a=1;b.textContent="Confirmer ?";setTimeout(()=>{a=0;b.textContent=txt},3000)}}
-          $("ra").onclick=()=>{sctx="lock";astep()};
-          $("au").onclick=()=>{sctx="set";const e=$("ae").value.trim(),p=$("ap").value;if(!e||p.length<8){toast("E-mail et mot de passe (8 caractères min.)");return}toast("Création…");A.acct("up",e,p)};
-          $("ai").onclick=()=>{sctx="set";const e=$("ae").value.trim(),p=$("ap").value;if(!e||!p){toast("E-mail et mot de passe");return}toast("Connexion…");A.acct("in",e,p)};
-          $("sy2").onclick=()=>{sctx="set";toast("Synchronisation…");A.push(false)};
-          two("pf","Écraser le compte avec ce coffre",()=>{sctx="set";A.push(true)});
-          two("pl","Remplacer ce coffre par celui du compte",()=>{sctx="set";A.pull(true)});
-          $("lo").onclick=()=>{A.logout();ac();toast("Déconnecté")};
           showLock();
           </script>
           </body>
           </html>
-          EOF_7
-          cat > app/src/main/res/drawable/ic_fg.xml <<'EOF_8'
+          EOF_6
+          cat > app/src/main/res/drawable/ic_fg.xml <<'EOF_7'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
@@ -1041,8 +1003,8 @@ jobs:
                   android:strokeLineCap="round"
                   android:pathData="M54,29L54,36"/>
           </vector>
-          EOF_8
-          cat > app/src/main/res/drawable/ic_bg.xml <<'EOF_9'
+          EOF_7
+          cat > app/src/main/res/drawable/ic_bg.xml <<'EOF_8'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
@@ -1053,14 +1015,14 @@ jobs:
                   android:fillColor="#0E1620"
                   android:pathData="M0,0h108v108h-108z"/>
           </vector>
-          EOF_9
-          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF_10'
+          EOF_8
+          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF_9'
           <?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
               <background android:drawable="@drawable/ic_bg"/>
               <foreground android:drawable="@drawable/ic_fg"/>
           </adaptive-icon>
-          EOF_10
+          EOF_9
       - name: Compiler
         run: gradle assembleDebug --no-daemon
       - name: Publier l'APK
