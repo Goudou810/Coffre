@@ -46,7 +46,7 @@ jobs:
                   minSdk 30
                   targetSdk 34
                   versionCode Integer.parseInt(System.getenv('GITHUB_RUN_NUMBER') ?: '1')
-                  versionName '1.2'
+                  versionName '1.3'
               }
               signingConfigs {
                   main {
@@ -65,6 +65,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
+              <uses-permission android:name="android.permission.INTERNET"/>
               <application
                   android:label="Coffre"
                   android:icon="@mipmap/ic_launcher"
@@ -109,14 +110,15 @@ jobs:
           import java.io.FileOutputStream;
           import java.io.InputStream;
           import java.security.SecureRandom;
+          import org.json.JSONObject;
 
           public class MainActivity extends Activity {
               WebView w;
               Handler h = new Handler(Looper.getMainLooper());
               boolean busy = false;
 
-              void js(String s) {
-                  w.evaluateJavascript(s, null);
+              void js(final String s) {
+                  runOnUiThread(() -> w.evaluateJavascript(s, null));
               }
 
               void startBio(final int step) {
@@ -199,6 +201,7 @@ jobs:
                           Vault.write(MainActivity.this);
                           Vault.legacy = false;
                           Backup.run(MainActivity.this);
+                          Sync.auto(MainActivity.this);
                           return true;
                       } catch (Exception e) {
                           return false;
@@ -212,6 +215,7 @@ jobs:
                           Vault.json = j;
                           Vault.write(MainActivity.this);
                           Backup.run(MainActivity.this);
+                          Sync.auto(MainActivity.this);
                           return true;
                       } catch (Exception e) {
                           return false;
@@ -256,6 +260,36 @@ jobs:
                           i.setType("*/*");
                           startActivityForResult(i, 2);
                       });
+                  }
+
+                  @JavascriptInterface
+                  public void acct(final String mode, final String email, final String pw) {
+                      new Thread(() -> js("sdone('acct'," + JSONObject.quote(Sync.login(MainActivity.this, mode, email.trim(), pw)) + ")")).start();
+                  }
+
+                  @JavascriptInterface
+                  public void push(final boolean force) {
+                      new Thread(() -> js("sdone('push'," + JSONObject.quote(Sync.push(MainActivity.this, force)) + ")")).start();
+                  }
+
+                  @JavascriptInterface
+                  public void pull(final boolean force) {
+                      new Thread(() -> js("sdone('pull'," + JSONObject.quote(Sync.pull(MainActivity.this, force)) + ")")).start();
+                  }
+
+                  @JavascriptInterface
+                  public void logout() {
+                      Sync.p(MainActivity.this).edit().clear().apply();
+                  }
+
+                  @JavascriptInterface
+                  public boolean cfg() {
+                      return !Sync.SB_URL.startsWith("__");
+                  }
+
+                  @JavascriptInterface
+                  public String sinfo() {
+                      return Sync.info(MainActivity.this);
                   }
 
                   @JavascriptInterface
@@ -521,7 +555,176 @@ jobs:
               }
           }
           EOF_5
-          cat > app/src/main/assets/index.html <<'EOF_6'
+          cat > app/src/main/java/com/coffre/app/Sync.java <<'EOF_6'
+          package com.coffre.app;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.util.Base64;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.nio.file.Files;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          public class Sync {
+              static final String SB_URL = "https://vklcgzwzxbwpjleepsdy.supabase.co";
+              static final String SB_KEY = "sb_publishable_o-DQCrukTQW6H55usOIJyQ_Qy7R9l2z";
+
+              static SharedPreferences p(Context c) {
+                  return c.getSharedPreferences("s", 0);
+              }
+
+              static void st(Context c, String s) {
+                  p(c).edit().putString("st", s).apply();
+              }
+
+              static String[] http(String method, String path, String bearer, String body) throws Exception {
+                  HttpURLConnection c = (HttpURLConnection) new URL(SB_URL + path).openConnection();
+                  c.setRequestMethod(method);
+                  c.setConnectTimeout(15000);
+                  c.setReadTimeout(30000);
+                  c.setRequestProperty("apikey", SB_KEY);
+                  if (bearer != null) c.setRequestProperty("Authorization", "Bearer " + bearer);
+                  c.setRequestProperty("Content-Type", "application/json");
+                  if (body != null) {
+                      c.setDoOutput(true);
+                      OutputStream o = c.getOutputStream();
+                      o.write(body.getBytes("UTF-8"));
+                      o.close();
+                  }
+                  int code = c.getResponseCode();
+                  InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+                  ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                  if (in != null) {
+                      byte[] buf = new byte[8192];
+                      int n;
+                      while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+                      in.close();
+                  }
+                  return new String[]{String.valueOf(code), bo.toString("UTF-8")};
+              }
+
+              static void save(Context c, JSONObject j, String email) throws Exception {
+                  SharedPreferences.Editor e = p(c).edit();
+                  e.putString("at", j.getString("access_token"));
+                  e.putString("rt", j.getString("refresh_token"));
+                  e.putLong("exp", System.currentTimeMillis() / 1000 + j.optLong("expires_in", 3600));
+                  if (email != null) e.putString("em", email);
+                  e.apply();
+              }
+
+              static String login(Context c, String mode, String email, String pw) {
+                  if (SB_URL.startsWith("__")) return "ERR:Serveur non configuré";
+                  try {
+                      JSONObject b = new JSONObject().put("email", email).put("password", pw);
+                      String path = mode.equals("up") ? "/auth/v1/signup" : "/auth/v1/token?grant_type=password";
+                      String[] r = http("POST", path, null, b.toString());
+                      JSONObject j = new JSONObject(r[1]);
+                      if (!j.has("access_token")) {
+                          if (r[0].startsWith("2")) return "ERR:Confirmation d'e-mail activée dans Supabase : désactive-la";
+                          return "ERR:" + j.optString("msg", j.optString("error_description", j.optString("message", "Échec")));
+                      }
+                      p(c).edit().clear().apply();
+                      save(c, j, email);
+                      return "OK";
+                  } catch (Exception e) {
+                      return "ERR:Réseau indisponible";
+                  }
+              }
+
+              static String token(Context c) {
+                  SharedPreferences s = p(c);
+                  String at = s.getString("at", null);
+                  if (at == null) return null;
+                  if (s.getLong("exp", 0) > System.currentTimeMillis() / 1000 + 60) return at;
+                  try {
+                      JSONObject b = new JSONObject().put("refresh_token", s.getString("rt", ""));
+                      String[] r = http("POST", "/auth/v1/token?grant_type=refresh_token", null, b.toString());
+                      JSONObject j = new JSONObject(r[1]);
+                      if (!j.has("access_token")) return null;
+                      save(c, j, null);
+                      return j.getString("access_token");
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              static synchronized String push(Context c, boolean force) {
+                  try {
+                      String t = token(c);
+                      if (t == null) return "ERR:Non connecté, reconnecte-toi";
+                      int prev = p(c).getInt("rev", 0);
+                      if (force) {
+                          String[] g = http("GET", "/rest/v1/vaults?select=rev", t, null);
+                          JSONArray a = new JSONArray(g[1]);
+                          prev = a.length() == 0 ? 0 : a.getJSONObject(0).getInt("rev");
+                      }
+                      byte[] b = Files.readAllBytes(Vault.file(c).toPath());
+                      JSONObject body = new JSONObject()
+                              .put("p_blob", Base64.encodeToString(b, Base64.NO_WRAP))
+                              .put("p_prev", prev);
+                      String[] r = http("POST", "/rest/v1/rpc/push_vault", t, body.toString());
+                      if (!r[0].startsWith("2")) return "ERR:Serveur " + r[0];
+                      int n = Integer.parseInt(r[1].trim());
+                      if (n < 0) {
+                          st(c, "conflit");
+                          return "CONFLICT";
+                      }
+                      p(c).edit().putInt("rev", n).putLong("ok", System.currentTimeMillis()).putString("st", "ok").apply();
+                      return "OK";
+                  } catch (Exception e) {
+                      st(c, "off");
+                      return "ERR:Réseau indisponible";
+                  }
+              }
+
+              static synchronized String pull(Context c, boolean force) {
+                  try {
+                      String t = token(c);
+                      if (t == null) return "ERR:Non connecté, reconnecte-toi";
+                      if (!force && Vault.file(c).exists()) return "ERR:Un coffre existe déjà sur ce téléphone";
+                      String[] r = http("GET", "/rest/v1/vaults?select=blob,rev", t, null);
+                      if (!r[0].startsWith("2")) return "ERR:Serveur " + r[0];
+                      JSONArray a = new JSONArray(r[1]);
+                      if (a.length() == 0) return "EMPTY";
+                      byte[] b = Base64.decode(a.getJSONObject(0).getString("blob"), Base64.DEFAULT);
+                      if (b.length < 29) return "ERR:Données invalides";
+                      File tmp = new File(c.getFilesDir(), "vault.tmp");
+                      FileOutputStream fo = new FileOutputStream(tmp);
+                      fo.write(b);
+                      fo.close();
+                      if (!tmp.renameTo(Vault.file(c))) return "ERR:Écriture impossible";
+                      p(c).edit().putInt("rev", a.getJSONObject(0).getInt("rev"))
+                              .putLong("ok", System.currentTimeMillis()).putString("st", "ok").apply();
+                      return "OK";
+                  } catch (Exception e) {
+                      return "ERR:Réseau indisponible";
+                  }
+              }
+
+              static void auto(final Context c) {
+                  if (p(c).getString("at", null) == null) return;
+                  new Thread(() -> push(c, false)).start();
+              }
+
+              static String info(Context c) {
+                  SharedPreferences s = p(c);
+                  try {
+                      String e = s.getString("at", null) == null ? "" : s.getString("em", "");
+                      return new JSONObject().put("e", e).put("ok", s.getLong("ok", 0)).put("st", s.getString("st", "")).toString();
+                  } catch (Exception e) {
+                      return "{}";
+                  }
+              }
+          }
+          EOF_6
+          cat > app/src/main/assets/index.html <<'EOF_7'
           <!DOCTYPE html>
           <html lang="fr">
           <head>
@@ -587,6 +790,7 @@ jobs:
           <div id="err"></div>
           <button class="btn" id="go"></button>
           <button class="btn g" id="rs">Restaurer une sauvegarde</button>
+          <button class="btn g" id="ra">Se connecter à mon compte</button>
           </div>
           </div>
           <div id="app">
@@ -607,6 +811,22 @@ jobs:
           <button class="btn" id="bf" style="width:100%">Choisir où sauvegarder</button>
           <button class="btn g" id="bn" style="width:100%;margin-top:8px">Sauvegarder maintenant</button>
           <p class="mu" style="text-align:left;margin-top:14px">La sauvegarde est chiffrée avec ton code. Au choix : Google Drive, si Android te le permet, ou le stockage du téléphone. Le fichier est mis à jour après chaque modification.</p>
+          <div id="acc">
+          <label style="margin-top:22px">Compte en ligne</label>
+          <div id="as" class="mu" style="text-align:left;white-space:pre-line;margin-bottom:10px"></div>
+          <div id="al">
+          <input id="ae" type="text" placeholder="E-mail" autocomplete="off" style="margin-bottom:8px">
+          <input id="ap" type="password" placeholder="Mot de passe du compte" autocomplete="off">
+          <div class="rw" style="margin-top:8px"><button class="btn" id="au" style="flex:1">Créer le compte</button><button class="btn g" id="ai" style="flex:1">Se connecter</button></div>
+          </div>
+          <div id="ao" style="display:none">
+          <button class="btn" id="sy2" style="width:100%">Synchroniser maintenant</button>
+          <button class="btn g" id="pf" style="width:100%;margin-top:8px">Écraser le compte avec ce coffre</button>
+          <button class="btn g" id="pl" style="width:100%;margin-top:8px">Remplacer ce coffre par celui du compte</button>
+          <button class="btn g" id="lo" style="width:100%;margin-top:8px">Se déconnecter</button>
+          </div>
+          <p class="mu" style="text-align:left;margin-top:14px">Le compte ne stocke que ton coffre chiffré. Utilise un mot de passe de compte différent de celui du coffre.</p>
+          </div>
           </div>
           <nav><button id="n0" class="on">Coffre</button><button id="n1">Générateur</button><button id="n2">Réglages</button></nav>
           </div>
@@ -647,7 +867,7 @@ jobs:
           function showLock(){
            E=[];cur=null;P="";Q="";AN="";$("sheet").classList.remove("on");$("app").style.display="none";$("lock").style.display="flex";
            const has=!!A&&A.has()===true;flow=has?"unlock":"create";
-           $("rs").style.display=has?"none":"block";
+           $("rs").style.display=has?"none":"block";$("ra").style.display=has||!(A&&A.cfg())?"none":"block";
            step(has?"u1":"c1");
           }
           function lockUI(){if(A)A.lock();showLock()}
@@ -692,6 +912,7 @@ jobs:
           $("go").onclick=()=>{
            if(!A){err("Ouvre ce coffre depuis l'application.");return}
            if(st[0]=="b"){err("");bstep(+st[1]);return}
+           if(st=="a1"){const e=$("i1").value.trim(),w=$("i2").value;if(!e||!w)return;err("");$("go").disabled=true;$("go").textContent="…";A.acct("in",e,w);return}
            const a=$("i1").value,b=$("i2").value;err("");
            if(Date.now()<until){err("Attends "+Math.ceil((until-Date.now())/1000)+" s");return}
            if(st=="c1"){if(a.length<6){err("6 caractères minimum");return}if(a!==b){err("Les deux mots de passe sont différents");return}P=a;step("c2");return}
@@ -699,7 +920,7 @@ jobs:
            if(st=="u1"){if(!a)return;P=a;Q=A.question();if(Q)step("u2");else tryUnlock("");return}
            if(st=="u2"){if(!a)return;AN=a;tryUnlock(a)}
           };
-          function tab(i){[0,1,2].forEach(k=>{$("v"+k).classList.toggle("on",k==i);$("n"+k).classList.toggle("on",k==i)});if(i==1&&!$("out").textContent)$("out").textContent=gen();if(i==2)bk()}
+          function tab(i){[0,1,2].forEach(k=>{$("v"+k).classList.toggle("on",k==i);$("n"+k).classList.toggle("on",k==i)});if(i==1&&!$("out").textContent)$("out").textContent=gen();if(i==2){bk();ac()}}
           $("n0").onclick=()=>tab(0);$("n1").onclick=()=>tab(1);$("n2").onclick=()=>tab(2);$("lk").onclick=lockUI;
           function list(){
            const q=$("q").value.toLowerCase(),L=$("list");L.innerHTML="";
@@ -753,12 +974,47 @@ jobs:
           $("bf").onclick=()=>A.pickFile();
           $("bn").onclick=()=>{toast(A.backupNow()===true?"Sauvegarde faite":"Échec : choisis un emplacement");bk()};
           $("rs").onclick=()=>A.restore();
+          let sctx="set";
+          function astep(){st="a1";err("");$("note").textContent="";$("stp").textContent="Compte en ligne";$("msg").textContent="Connecte-toi pour récupérer ton coffre.";$("i1").type="text";$("i1").placeholder="E-mail";$("i2").placeholder="Mot de passe du compte";$("i1").value="";$("i2").value="";$("i1").style.display="block";$("i2").style.display="block";$("go").textContent="Se connecter";$("go").style.display="block";idle()}
+          function lerr(m){idle();$("go").textContent="Se connecter";err(m)}
+          function sdone(op,r){
+           const bad=r.startsWith("ERR"),m=bad?r.slice(4):"";
+           if(op=="acct"){
+            if(bad){if(sctx=="lock")lerr(m);else{toast(m);ac()}return}
+            if(sctx=="lock")A.pull(false);else A.push(false);
+            return;
+           }
+           if(op=="pull"){
+            if(r=="OK"){if(sctx=="lock"){showLock();toast("Coffre récupéré : entre tes identifiants")}else{lockUI();toast("Coffre remplacé : entre tes identifiants")}return}
+            if(r=="EMPTY"){if(sctx=="lock")lerr("Aucun coffre en ligne pour ce compte");else toast("Aucun coffre en ligne");return}
+            if(sctx=="lock")lerr(m);else toast(m);
+            return;
+           }
+           toast(r=="OK"?"Synchronisé":r=="CONFLICT"?"Conflit : récupère ou écrase":m);ac();
+          }
+          function ac(){
+           if(!A)return;
+           const cf=A.cfg();$("acc").style.display=cf?"block":"none";if(!cf)return;
+           let i={};try{i=JSON.parse(A.sinfo())}catch(x){}
+           const on=!!i.e;
+           $("al").style.display=on?"none":"block";$("ao").style.display=on?"block":"none";
+           const S={ok:"À jour",conflit:"Conflit : un autre appareil a modifié le coffre",off:"Hors ligne : renvoi à la prochaine modification"};
+           $("as").textContent=on?"Connecté : "+i.e+"\n"+(S[i.st]||"")+(i.ok?"\nDernière synchro : "+new Date(i.ok).toLocaleString("fr-FR"):""):"Non connecté. Un compte permet de retrouver ton coffre sur un autre téléphone.";
+          }
+          function two(id,txt,fn){const b=$(id);let a=0;b.onclick=()=>{if(a){a=0;b.textContent=txt;fn();return}a=1;b.textContent="Confirmer ?";setTimeout(()=>{a=0;b.textContent=txt},3000)}}
+          $("ra").onclick=()=>{sctx="lock";astep()};
+          $("au").onclick=()=>{sctx="set";const e=$("ae").value.trim(),p=$("ap").value;if(!e||p.length<8){toast("E-mail et mot de passe (8 caractères min.)");return}toast("Création…");A.acct("up",e,p)};
+          $("ai").onclick=()=>{sctx="set";const e=$("ae").value.trim(),p=$("ap").value;if(!e||!p){toast("E-mail et mot de passe");return}toast("Connexion…");A.acct("in",e,p)};
+          $("sy2").onclick=()=>{sctx="set";toast("Synchronisation…");A.push(false)};
+          two("pf","Écraser le compte avec ce coffre",()=>{sctx="set";A.push(true)});
+          two("pl","Remplacer ce coffre par celui du compte",()=>{sctx="set";A.pull(true)});
+          $("lo").onclick=()=>{A.logout();ac();toast("Déconnecté")};
           showLock();
           </script>
           </body>
           </html>
-          EOF_6
-          cat > app/src/main/res/drawable/ic_fg.xml <<'EOF_7'
+          EOF_7
+          cat > app/src/main/res/drawable/ic_fg.xml <<'EOF_8'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
@@ -785,8 +1041,8 @@ jobs:
                   android:strokeLineCap="round"
                   android:pathData="M54,29L54,36"/>
           </vector>
-          EOF_7
-          cat > app/src/main/res/drawable/ic_bg.xml <<'EOF_8'
+          EOF_8
+          cat > app/src/main/res/drawable/ic_bg.xml <<'EOF_9'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
@@ -797,14 +1053,14 @@ jobs:
                   android:fillColor="#0E1620"
                   android:pathData="M0,0h108v108h-108z"/>
           </vector>
-          EOF_8
-          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF_9'
+          EOF_9
+          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF_10'
           <?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
               <background android:drawable="@drawable/ic_bg"/>
               <foreground android:drawable="@drawable/ic_fg"/>
           </adaptive-icon>
-          EOF_9
+          EOF_10
       - name: Compiler
         run: gradle assembleDebug --no-daemon
       - name: Publier l'APK
