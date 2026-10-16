@@ -43,10 +43,10 @@ jobs:
               compileSdk 34
               defaultConfig {
                   applicationId 'com.coffre.app'
-                  minSdk 26
+                  minSdk 30
                   targetSdk 34
                   versionCode Integer.parseInt(System.getenv('GITHUB_RUN_NUMBER') ?: '1')
-                  versionName '1.1'
+                  versionName '1.2'
               }
               signingConfigs {
                   main {
@@ -64,6 +64,7 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'EOF_2'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
               <application
                   android:label="Coffre"
                   android:icon="@mipmap/ic_launcher"
@@ -89,9 +90,13 @@ jobs:
           import android.content.ClipData;
           import android.content.ClipboardManager;
           import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.hardware.biometrics.BiometricManager;
+          import android.hardware.biometrics.BiometricPrompt;
           import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
+          import android.os.CancellationSignal;
           import android.os.Handler;
           import android.os.Looper;
           import android.os.PersistableBundle;
@@ -110,6 +115,30 @@ jobs:
               Handler h = new Handler(Looper.getMainLooper());
               boolean busy = false;
 
+              void js(String s) {
+                  w.evaluateJavascript(s, null);
+              }
+
+              void startBio(final int step) {
+                  BiometricPrompt.Builder b = new BiometricPrompt.Builder(this)
+                          .setTitle(step == 3 ? "Étape 3 : visage" : "Étape 4 : empreinte")
+                          .setAllowedAuthenticators(step == 3 ? BiometricManager.Authenticators.BIOMETRIC_WEAK
+                                  : BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                          .setNegativeButton("Annuler", getMainExecutor(), (d, i) -> js("bioDone(" + step + ",false)"));
+                  b.build().authenticate(new CancellationSignal(), getMainExecutor(), new BiometricPrompt.AuthenticationCallback() {
+                      @Override
+                      public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult r) {
+                          if (step == 4) Vault.gate = true;
+                          js("bioDone(" + step + ",true)");
+                      }
+
+                      @Override
+                      public void onAuthenticationError(int code, CharSequence m) {
+                          js("bioDone(" + step + ",false)");
+                      }
+                  });
+              }
+
               public class Bridge {
                   @JavascriptInterface
                   public boolean has() {
@@ -117,14 +146,58 @@ jobs:
                   }
 
                   @JavascriptInterface
-                  public boolean create(String pin, String json) {
+                  public String question() {
+                      return Vault.question(MainActivity.this);
+                  }
+
+                  @JavascriptInterface
+                  public String caps() {
+                      BiometricManager bm = getSystemService(BiometricManager.class);
+                      boolean strong = bm.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                              == BiometricManager.BIOMETRIC_SUCCESS;
+                      boolean face = getPackageManager().hasSystemFeature(PackageManager.FEATURE_FACE)
+                              && bm.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
+                              == BiometricManager.BIOMETRIC_SUCCESS;
+                      return (face ? "1" : "0") + (strong ? "1" : "0");
+                  }
+
+                  @JavascriptInterface
+                  public void bio(final int step) {
+                      runOnUiThread(() -> startBio(step));
+                  }
+
+                  @JavascriptInterface
+                  public String unlock(String pin, String ans) {
                       try {
-                          if (Vault.file(MainActivity.this).exists()) return false;
+                          Vault.lock();
+                          Vault.open(MainActivity.this, pin, ans);
+                          return Vault.legacy ? "LEG" : "OK";
+                      } catch (Exception e) {
+                          Vault.lock();
+                          return "ERR";
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public String data() {
+                      return Vault.gate && Vault.json != null ? Vault.json : "ERR";
+                  }
+
+                  @JavascriptInterface
+                  public boolean setup(String pin, String q, String ans) {
+                      try {
+                          if (!Vault.gate) return false;
+                          boolean exists = Vault.file(MainActivity.this).exists();
+                          if (exists && !Vault.legacy) return false;
+                          String j = exists ? Vault.json : "{\"e\":[]}";
                           byte[] s = new byte[16];
                           new SecureRandom().nextBytes(s);
                           Vault.salt = s;
-                          Vault.key = Vault.derive(pin, s);
-                          Vault.write(MainActivity.this, json);
+                          Vault.q = q;
+                          Vault.json = j;
+                          Vault.key = Vault.derive(pin, ans, s);
+                          Vault.write(MainActivity.this);
+                          Vault.legacy = false;
                           Backup.run(MainActivity.this);
                           return true;
                       } catch (Exception e) {
@@ -133,19 +206,11 @@ jobs:
                   }
 
                   @JavascriptInterface
-                  public String unlock(String pin) {
+                  public boolean save(String j) {
                       try {
-                          return "OK" + Vault.open(MainActivity.this, pin);
-                      } catch (Exception e) {
-                          return "ERR";
-                      }
-                  }
-
-                  @JavascriptInterface
-                  public boolean save(String json) {
-                      try {
-                          if (Vault.key == null) return false;
-                          Vault.write(MainActivity.this, json);
+                          if (Vault.key == null || !Vault.gate || Vault.legacy) return false;
+                          Vault.json = j;
+                          Vault.write(MainActivity.this);
                           Backup.run(MainActivity.this);
                           return true;
                       } catch (Exception e) {
@@ -155,7 +220,7 @@ jobs:
 
                   @JavascriptInterface
                   public void lock() {
-                      Vault.key = null;
+                      Vault.lock();
                   }
 
                   @JavascriptInterface
@@ -205,10 +270,7 @@ jobs:
                           }
                           cm.setPrimaryClip(d);
                           h.removeCallbacksAndMessages(null);
-                          h.postDelayed(() -> {
-                              if (Build.VERSION.SDK_INT >= 28) cm.clearPrimaryClip();
-                              else cm.setPrimaryClip(ClipData.newPlainText("", ""));
-                          }, 30000);
+                          h.postDelayed(() -> cm.clearPrimaryClip(), 30000);
                       });
                   }
               }
@@ -242,7 +304,7 @@ jobs:
                           Backup.p(this).edit().putString("doc", u.toString()).apply();
                           new Thread(() -> {
                               Backup.run(MainActivity.this);
-                              runOnUiThread(() -> w.evaluateJavascript("bk()", null));
+                              runOnUiThread(() -> js("bk()"));
                           }).start();
                       } else if (rq == 2) {
                           InputStream in = getContentResolver().openInputStream(u);
@@ -258,10 +320,10 @@ jobs:
                           fo.write(b);
                           fo.close();
                           tmp.renameTo(Vault.file(this));
-                          w.evaluateJavascript("showLock();toast('Sauvegarde restaurée : entre ton code')", null);
+                          js("showLock();toast('Sauvegarde restaurée : entre tes identifiants')");
                       }
                   } catch (Exception e) {
-                      w.evaluateJavascript("toast('Échec')", null);
+                      js("toast('Échec')");
                   }
               }
 
@@ -269,8 +331,8 @@ jobs:
               protected void onStop() {
                   super.onStop();
                   if (!busy) {
-                      Vault.key = null;
-                      w.evaluateJavascript("lockUI()", null);
+                      Vault.lock();
+                      js("lockUI()");
                   }
               }
 
@@ -291,6 +353,7 @@ jobs:
           import java.io.FileOutputStream;
           import java.nio.file.Files;
           import java.security.SecureRandom;
+          import java.text.Normalizer;
           import java.util.Arrays;
           import javax.crypto.Cipher;
           import javax.crypto.SecretKeyFactory;
@@ -301,24 +364,57 @@ jobs:
           public class Vault {
               static SecretKeySpec key;
               static byte[] salt;
+              static String q = "";
+              static String json;
+              static boolean gate;
+              static boolean legacy;
 
               static File file(Context c) {
                   return new File(c.getFilesDir(), "vault.bin");
               }
 
-              static SecretKeySpec derive(String pin, byte[] s) throws Exception {
+              static String norm(String a) {
+                  String s = Normalizer.normalize(a == null ? "" : a, Normalizer.Form.NFD);
+                  return s.replaceAll("\\p{M}", "").toLowerCase().replaceAll("\\s+", " ").trim();
+              }
+
+              static SecretKeySpec derive(String pin, String ans, byte[] s) throws Exception {
+                  String secret = ans == null ? pin : pin.length() + ":" + pin + "|" + norm(ans);
                   SecretKeyFactory f = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
-                  byte[] k = f.generateSecret(new PBEKeySpec(pin.toCharArray(), s, 310000, 256)).getEncoded();
+                  byte[] k = f.generateSecret(new PBEKeySpec(secret.toCharArray(), s, 310000, 256)).getEncoded();
                   return new SecretKeySpec(k, "AES");
               }
 
-              static void write(Context c, String json) throws Exception {
+              static boolean v2(byte[] b) {
+                  return b.length > 5 && b[0] == 'C' && b[1] == 'V' && b[2] == '2';
+              }
+
+              static String question(Context c) {
+                  try {
+                      byte[] b = Files.readAllBytes(file(c).toPath());
+                      if (v2(b)) {
+                          int n = ((b[3] & 255) << 8) | (b[4] & 255);
+                          return new String(b, 5, n, "UTF-8");
+                      }
+                  } catch (Exception e) {
+                  }
+                  return "";
+              }
+
+              static void write(Context c) throws Exception {
                   byte[] iv = new byte[12];
                   new SecureRandom().nextBytes(iv);
                   Cipher ci = Cipher.getInstance("AES/GCM/NoPadding");
                   ci.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(128, iv));
                   byte[] ct = ci.doFinal(json.getBytes("UTF-8"));
+                  byte[] qb = q.getBytes("UTF-8");
                   ByteArrayOutputStream o = new ByteArrayOutputStream();
+                  o.write('C');
+                  o.write('V');
+                  o.write('2');
+                  o.write(qb.length >> 8);
+                  o.write(qb.length & 255);
+                  o.write(qb);
                   o.write(salt);
                   o.write(iv);
                   o.write(ct);
@@ -330,18 +426,35 @@ jobs:
                   if (!tmp.renameTo(file(c))) throw new Exception("rename");
               }
 
-              static String open(Context c, String pin) throws Exception {
+              static void open(Context c, String pin, String ans) throws Exception {
                   byte[] b = Files.readAllBytes(file(c).toPath());
-                  byte[] s = Arrays.copyOfRange(b, 0, 16);
-                  byte[] iv = Arrays.copyOfRange(b, 16, 28);
-                  byte[] ct = Arrays.copyOfRange(b, 28, b.length);
-                  SecretKeySpec k = derive(pin, s);
+                  boolean is2 = v2(b);
+                  int off = 0;
+                  String qq = "";
+                  if (is2) {
+                      int n = ((b[3] & 255) << 8) | (b[4] & 255);
+                      qq = new String(b, 5, n, "UTF-8");
+                      off = 5 + n;
+                  }
+                  byte[] s = Arrays.copyOfRange(b, off, off + 16);
+                  byte[] iv = Arrays.copyOfRange(b, off + 16, off + 28);
+                  byte[] ct = Arrays.copyOfRange(b, off + 28, b.length);
+                  SecretKeySpec k = derive(pin, is2 ? ans : null, s);
                   Cipher ci = Cipher.getInstance("AES/GCM/NoPadding");
                   ci.init(Cipher.DECRYPT_MODE, k, new GCMParameterSpec(128, iv));
-                  String json = new String(ci.doFinal(ct), "UTF-8");
+                  String j = new String(ci.doFinal(ct), "UTF-8");
                   key = k;
                   salt = s;
-                  return json;
+                  q = qq;
+                  json = j;
+                  legacy = !is2;
+              }
+
+              static void lock() {
+                  key = null;
+                  json = null;
+                  gate = false;
+                  legacy = false;
               }
           }
           EOF_4
@@ -466,9 +579,11 @@ jobs:
           <svg id="dial" viewBox="0 0 200 200"><circle cx="100" cy="100" r="92" fill="none" stroke="#D4A84B" stroke-width="4"/><g id="dt" stroke="#D4A84B" stroke-linecap="round"></g><circle cx="100" cy="100" r="58" fill="#16222F" stroke="#25364A" stroke-width="3"/><circle cx="100" cy="100" r="12" fill="#D4A84B"/><path d="M100 36L94 48H106Z" fill="#E8EEF4"/></svg>
           <div class="box" id="box">
           <h1>Coffre</h1>
+          <p class="mu" id="stp" style="color:var(--br);font-weight:700"></p>
           <p class="mu" id="msg"></p>
-          <input id="pin" type="password" placeholder="Code secret" autocomplete="off">
-          <input id="pin2" type="password" placeholder="Confirmer le code" autocomplete="off">
+          <input id="i1" autocomplete="off">
+          <input id="i2" type="password" autocomplete="off">
+          <div class="mu" id="note"></div>
           <div id="err"></div>
           <button class="btn" id="go"></button>
           <button class="btn g" id="rs">Restaurer une sauvegarde</button>
@@ -512,35 +627,77 @@ jobs:
           for(let i=0;i<36;i++){const a=i*Math.PI/18,r=i%3?82:77,l=document.createElementNS(NS,"line");l.setAttribute("x1",100+r*Math.sin(a));l.setAttribute("y1",100-r*Math.cos(a));l.setAttribute("x2",100+88*Math.sin(a));l.setAttribute("y2",100-88*Math.cos(a));l.setAttribute("stroke-width",i%9?1.5:3);$("dt").append(l)}
           function toast(m){const t=$("toast");t.textContent=m;t.style.display="block";clearTimeout(tt);tt=setTimeout(()=>t.style.display="none",1800)}
           function err(m){$("err").textContent=m}
-          function idle(){$("go").disabled=false;$("go").textContent=mode=="create"?"Créer le coffre":"Déverrouiller"}
+          function idle(){$("go").disabled=false}
+          let st,flow,P="",Q="",AN="";
+          function step(s){
+           st=s;err("");$("note").textContent="";$("i1").value="";$("i2").value="";
+           const T={
+            c1:["Étape 1 sur 4","Choisis ton mot de passe : 6 caractères minimum, 8 ou plus conseillés. Impossible de le récupérer si tu l'oublies.","Mot de passe","Confirmer le mot de passe"],
+            c2:["Étape 2 sur 4","Écris une question secrète et sa réponse. Les deux seront demandées à chaque ouverture.","Ta question","Ta réponse"],
+            u1:["Étape 1 sur 4","Entre ton mot de passe.","Mot de passe",""],
+            u2:["Étape 2 sur 4",Q,"Ta réponse",""]
+           }[s];
+           $("stp").textContent=T[0];$("msg").textContent=T[1];
+           $("i1").placeholder=T[2];$("i2").placeholder=T[3];
+           $("i1").type=s=="c2"?"text":"password";
+           $("i1").style.display="block";$("i2").style.display=T[3]?"block":"none";
+           $("go").textContent="Continuer";$("go").style.display="block";idle();
+          }
+          function shake(){const b=$("box");b.classList.remove("sh");void b.offsetWidth;b.classList.add("sh")}
           function showLock(){
-           E=[];cur=null;$("sheet").classList.remove("on");$("app").style.display="none";$("lock").style.display="flex";
-           $("pin").value="";$("pin2").value="";err("");
-           mode=A&&A.has()===true?"unlock":"create";
-           $("rs").style.display=mode=="create"?"block":"none";
-           $("pin2").style.display=mode=="create"?"block":"none";
-           $("msg").textContent=mode=="create"?"Choisis un code secret (6 caractères minimum). Impossible de le récupérer si tu l'oublies.":"Entre ton code pour ouvrir le coffre.";
-           idle();
+           E=[];cur=null;P="";Q="";AN="";$("sheet").classList.remove("on");$("app").style.display="none";$("lock").style.display="flex";
+           const has=!!A&&A.has()===true;flow=has?"unlock":"create";
+           $("rs").style.display=has?"none":"block";
+           step(has?"u1":"c1");
           }
           function lockUI(){if(A)A.lock();showLock()}
           function enter(){const d=$("dial");d.classList.add("spin");setTimeout(()=>{d.classList.remove("spin");$("lock").style.display="none";$("app").style.display="flex";tab(0);list();try{if(!JSON.parse(A.info()).f)toast("Pense à activer la sauvegarde (Réglages)")}catch(x){}},650)}
-          $("go").onclick=()=>{
-           if(!A){err("Ouvre ce coffre depuis l'application.");return}
-           const p=$("pin").value;err("");
-           if(Date.now()<until){err("Attends "+Math.ceil((until-Date.now())/1000)+" s");return}
-           if(mode=="create"){
-            if(p.length<6){err("6 caractères minimum");return}
-            if(p!==$("pin2").value){err("Les deux codes sont différents");return}
-           }
+          function bstep(n){
+           st="b"+n;err("");$("i1").style.display="none";$("i2").style.display="none";
+           $("stp").textContent="Étape "+n+" sur 4";
+           $("msg").textContent=n==3?"Vérification du visage…":"Pose ton doigt sur le capteur d'empreintes.";
+           $("go").textContent="Réessayer";$("go").style.display="none";
+           A.bio(n);
+          }
+          function bioDone(n,ok){
+           if(!ok){err("Vérification annulée ou refusée.");$("go").style.display="block";idle();return}
+           if(n==3){bstep(4);return}
+           finish();
+          }
+          function nextBio(){
+           const c=A.caps();
+           if(c[1]!="1"){step(flow=="unlock"?"u1":"c1");err("Aucune empreinte enregistrée : ajoute-en une dans les réglages du téléphone.");return}
+           if(c[0]=="1")bstep(3);else{bstep(4);$("note").textContent="Visage : indisponible sur ce téléphone (Android ne l'ouvre pas aux apps)."}
+          }
+          function tryUnlock(ans){
            $("go").disabled=true;$("go").textContent="…";
            setTimeout(()=>{
-            if(mode=="create"){if(A.create(p,JSON.stringify({e:[]}))===true){E=[];enter()}else{err("Création impossible");idle()}return}
-            const r=A.unlock(p);
-            let ok=typeof r==="string"&&r.slice(0,2)==="OK";
-            if(ok){try{E=JSON.parse(r.slice(2)).e||[]}catch(x){ok=false}}
-            if(!ok){fails++;until=Date.now()+Math.min(fails*2,30)*1000;err("Code incorrect");const b=$("box");b.classList.remove("sh");void b.offsetWidth;b.classList.add("sh");idle();return}
-            fails=0;$("pin").value="";enter();
+            const r=A.unlock(P,ans);
+            if(r==="OK"){flow="unlock";nextBio();return}
+            if(r==="LEG"){flow="legacy";step("c2");$("msg").textContent="Mise à niveau : ajoute une question secrète et sa réponse.";return}
+            fails++;until=Date.now()+Math.min(fails*2,30)*1000;P="";AN="";
+            step("u1");err("Mot de passe ou réponse incorrect");shake();
            },60);
+          }
+          function finish(){
+           try{
+            if(flow=="unlock"){const d=A.data();if(d==="ERR")throw 0;E=JSON.parse(d).e||[]}
+            else{
+             if(A.setup(P,Q,AN)!==true)throw 0;
+             const d=A.data();E=flow=="legacy"&&d!=="ERR"?(JSON.parse(d).e||[]):[];
+            }
+           }catch(x){step(flow=="create"?"c1":"u1");err("Erreur : recommence");return}
+           P="";AN="";Q="";fails=0;enter();
+          }
+          $("go").onclick=()=>{
+           if(!A){err("Ouvre ce coffre depuis l'application.");return}
+           if(st[0]=="b"){err("");bstep(+st[1]);return}
+           const a=$("i1").value,b=$("i2").value;err("");
+           if(Date.now()<until){err("Attends "+Math.ceil((until-Date.now())/1000)+" s");return}
+           if(st=="c1"){if(a.length<6){err("6 caractères minimum");return}if(a!==b){err("Les deux mots de passe sont différents");return}P=a;step("c2");return}
+           if(st=="c2"){if(a.trim().length<5||b.trim().length<2){err("Question (5 caractères min.) et réponse requises");return}Q=a.trim();AN=b;nextBio();return}
+           if(st=="u1"){if(!a)return;P=a;Q=A.question();if(Q)step("u2");else tryUnlock("");return}
+           if(st=="u2"){if(!a)return;AN=a;tryUnlock(a)}
           };
           function tab(i){[0,1,2].forEach(k=>{$("v"+k).classList.toggle("on",k==i);$("n"+k).classList.toggle("on",k==i)});if(i==1&&!$("out").textContent)$("out").textContent=gen();if(i==2)bk()}
           $("n0").onclick=()=>tab(0);$("n1").onclick=()=>tab(1);$("n2").onclick=()=>tab(2);$("lk").onclick=lockUI;
