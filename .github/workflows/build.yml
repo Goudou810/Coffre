@@ -46,7 +46,7 @@ jobs:
                   minSdk 26
                   targetSdk 34
                   versionCode Integer.parseInt(System.getenv('GITHUB_RUN_NUMBER') ?: '1')
-                  versionName '1.4'
+                  versionName '1.5'
               }
               signingConfigs {
                   main {
@@ -204,6 +204,16 @@ jobs:
                   @JavascriptInterface
                   public void pull(final boolean force) {
                       new Thread(() -> done("pull", Sync.pull(MainActivity.this, force))).start();
+                  }
+
+                  @JavascriptInterface
+                  public void vstat() {
+                      new Thread(() -> done("vstat", Sync.verified(MainActivity.this))).start();
+                  }
+
+                  @JavascriptInterface
+                  public void resend() {
+                      new Thread(() -> done("resend", Sync.sendVerify(MainActivity.this))).start();
                   }
 
                   @JavascriptInterface
@@ -478,6 +488,8 @@ jobs:
                       if (s.equals("PERMISSION_DENIED") || m.contains("insufficient permissions")) {
                           return "Accès refusé : publie les règles Firestore.";
                       }
+                      if (m.contains("does not exist")) return "Firestore n'est pas créé : crée la base dans la console Firebase.";
+                      if (m.contains("has not been used") || m.contains("disabled")) return "L'API Firestore n'est pas activée : crée la base Firestore.";
                       return m.isEmpty() ? "Serveur " + r[0] : m;
                   } catch (Exception x) {
                       return "Serveur " + r[0];
@@ -503,9 +515,47 @@ jobs:
                               .putString("uid", j.getString("localId"))
                               .putString("em", email)
                               .apply();
+                      if (mode.equals("up")) sendVerify(c);
                       return "OK";
                   } catch (Exception e) {
                       return "ERR:Réseau indisponible";
+                  }
+              }
+
+              static String fail(Context c, String state, String detail) {
+                  p(c).edit().putString("st", state).putString("le", detail).apply();
+                  return "ERR:" + (state.equals("off") ? "Réseau indisponible" : detail);
+              }
+
+              static String sendVerify(Context c) {
+                  try {
+                      String t = token(c);
+                      if (t == null) return "ERR:Non connecté";
+                      JSONObject b = new JSONObject().put("requestType", "VERIFY_EMAIL").put("idToken", t);
+                      String[] r = http("POST", "https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=" + KEY,
+                              null, b.toString(), "application/json");
+                      if (r[0].startsWith("2")) {
+                          p(c).edit().putBoolean("vs", true).apply();
+                          return "OK";
+                      }
+                      JSONObject e = new JSONObject(r[1]).optJSONObject("error");
+                      return "ERR:" + fr(e == null ? "" : e.optString("message", ""));
+                  } catch (Exception e) {
+                      return "ERR:Réseau indisponible";
+                  }
+              }
+
+              static String verified(Context c) {
+                  try {
+                      String t = token(c);
+                      if (t == null) return "ERR";
+                      String[] r = http("POST", "https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=" + KEY, null,
+                              new JSONObject().put("idToken", t).toString(), "application/json");
+                      if (!r[0].startsWith("2")) return "ERR";
+                      boolean v = new JSONObject(r[1]).getJSONArray("users").getJSONObject(0).optBoolean("emailVerified", false);
+                      return v ? "1" : "0";
+                  } catch (Exception e) {
+                      return "ERR";
                   }
               }
 
@@ -558,10 +608,9 @@ jobs:
                           st(c, "conflit");
                           return "CONFLICT";
                       }
-                      return "ERR:" + errMsg(r);
+                      return fail(c, "err", errMsg(r));
                   } catch (Exception e) {
-                      st(c, "off");
-                      return "ERR:Réseau indisponible";
+                      return fail(c, "off", e.toString());
                   }
               }
 
@@ -572,8 +621,8 @@ jobs:
                       if (t == null || uid == null) return "ERR:Non connecté, reconnecte-toi";
                       if (!force && Vault.file(c).exists()) return "ERR:Un coffre existe déjà sur ce téléphone";
                       String[] r = http("GET", API + DOC + "/vaults/" + uid, t, null, "application/json");
-                      if (r[0].equals("404")) return "EMPTY";
-                      if (!r[0].startsWith("2")) return "ERR:" + errMsg(r);
+                      if (r[0].equals("404")) return r[1].contains("does not exist") ? fail(c, "err", errMsg(r)) : "EMPTY";
+                      if (!r[0].startsWith("2")) return fail(c, "err", errMsg(r));
                       JSONObject d = new JSONObject(r[1]);
                       String blob = d.getJSONObject("fields").getJSONObject("blob").getString("stringValue");
                       byte[] b = Base64.decode(blob, Base64.DEFAULT);
@@ -611,7 +660,8 @@ jobs:
                   SharedPreferences s = p(c);
                   try {
                       String e = s.getString("at", null) == null ? "" : s.getString("em", "");
-                      return new JSONObject().put("e", e).put("ok", s.getLong("ok", 0)).put("st", s.getString("st", "")).toString();
+                      return new JSONObject().put("e", e).put("ok", s.getLong("ok", 0)).put("st", s.getString("st", ""))
+                              .put("le", s.getString("le", "")).put("vs", s.getBoolean("vs", false)).toString();
                   } catch (Exception e) {
                       return "{}";
                   }
@@ -762,11 +812,12 @@ jobs:
           <button class="fab" id="add" aria-label="Ajouter"><i data-i="plus" data-s="26"></i></button>
           </div>
           <div id="v1" class="v">
-          <div class="cx prof"><div class="av" id="pav">?</div><div><b id="pe">Non connecté</b><span class="hint" id="ps" style="display:block;margin:2px 0 0"></span></div></div>
+          <div class="cx prof"><div class="av" id="pav">?</div><div><b id="pe">Non connecté</b><span class="hint" id="ps" style="display:block;margin:2px 0 0;white-space:pre-line"></span><span class="hint" id="vf" style="display:block;margin:2px 0 0"></span></div></div>
           <div class="cx" id="al"><h3>Relier à un compte</h3><p class="hint">Retrouve ton coffre sur n'importe quel téléphone. Ton mot de passe du coffre sert aussi de mot de passe de connexion.</p>
           <div class="fld"><i data-i="mail"></i><input id="le" type="email" placeholder="Adresse e-mail" autocomplete="off"></div>
           <button class="btn" id="lu">S'inscrire</button><button class="btn g" id="li">Se connecter</button></div>
           <div class="cx" id="ao"><h3>Synchronisation</h3>
+          <button class="btn g" id="rv" style="display:none">Renvoyer l'e-mail de vérification</button>
           <button class="btn" id="sy2">Synchroniser maintenant</button>
           <button class="btn g" id="pf">Écraser le compte avec ce coffre</button>
           <button class="btn g" id="pl">Remplacer ce coffre par celui du compte</button>
@@ -876,6 +927,7 @@ jobs:
            setTimeout(()=>{
             if(A.setup(P,Q,AN)!==true){busy("goQ",false);err("errQ","Création impossible, réessaie");return}
             E=[];P="";AN="";Q="";busy("goQ",false);enter();
+            if(ctx=="up")setTimeout(()=>{try{toast(JSON.parse(A.sinfo()).vs?"Compte créé : e-mail de vérification envoyé, regarde ta boîte et tes spams":"Compte créé")}catch(x){}},1200);
            },60);
           }
           function sdone(op,r){
@@ -895,6 +947,8 @@ jobs:
             if(r=="OK"){lockUI();toast("Coffre remplacé : déverrouille-le");return}
             toast(r=="EMPTY"?"Aucun coffre dans le compte":m);return;
            }
+           if(op=="vstat"){const v=$("vf");if(r=="1"){v.textContent="E-mail vérifié";v.style.color="var(--ok)";$("rv").style.display="none"}else if(r=="0"){v.textContent="E-mail non vérifié : ouvre le lien reçu par e-mail";v.style.color="var(--wn)";$("rv").style.display="block"}else{v.textContent="";$("rv").style.display="none"}return}
+           if(op=="resend"){toast(r=="OK"?"E-mail de vérification envoyé":m);return}
            toast(r=="OK"?"Synchronisé":r=="CONFLICT"?"Conflit : récupère ou écrase":m);pill();acv();
           }
           function tab(i){[0,1].forEach(k=>{$("v"+k).classList.toggle("on",k==i);$("n"+k).classList.toggle("on",k==i)});if(i==1)acv()}
@@ -904,7 +958,7 @@ jobs:
            let i={};try{i=JSON.parse(A.sinfo())}catch(x){}
            const p=$("pill");
            if(!i.e){p.className="pill";p.innerHTML='<span class="dot"></span>Non lié';return}
-           const m={ok:["ok","Synchronisé"],conflit:["wn","Conflit"],off:["","Hors ligne"]}[i.st]||["","En attente"];
+           const m={ok:["ok","Synchronisé"],conflit:["wn","Conflit"],err:["wn","Erreur"],off:["","Hors ligne"]}[i.st]||["","En attente"];
            p.className="pill "+m[0];p.innerHTML='<span class="dot"></span>'+m[1];
           }
           setInterval(pill,3000);
@@ -912,13 +966,14 @@ jobs:
            let i={};try{i=JSON.parse(A.sinfo())}catch(x){}
            const on=!!i.e;
            $("pe").textContent=on?i.e:"Non connecté";$("pav").textContent=on?i.e[0].toUpperCase():"?";$("pav").style.background=on?colr(i.e):"#243752";
-           const S={ok:"Synchronisé",conflit:"Conflit : un autre appareil a modifié le coffre",off:"Hors ligne : renvoi à la prochaine modification"};
-           $("ps").textContent=on?(S[i.st]||"En attente de synchronisation")+(i.ok?" - "+new Date(i.ok).toLocaleString("fr-FR"):""):"Aucun compte relié";
+           const S={ok:"Synchronisé",conflit:"Conflit : un autre appareil a modifié le coffre",err:"Erreur de synchronisation",off:"Hors ligne : renvoi à la prochaine modification"};
+           $("ps").textContent=on?(S[i.st]||"En attente de synchronisation")+(i.ok?" - "+new Date(i.ok).toLocaleString("fr-FR"):"")+(i.st&&i.st!="ok"&&i.le?"\nDétail : "+i.le:""):"Aucun compte relié";
            $("al").style.display=on?"none":"block";$("ao").style.display=on?"block":"none";
+           if(on)A.vstat();else{$("vf").textContent="";$("rv").style.display="none"}
           }
           function two(id,txt,fn){const b=$(id);let a=0;b.onclick=()=>{if(a){a=0;b.textContent=txt;fn();return}a=1;b.textContent="Confirmer ?";setTimeout(()=>{a=0;b.textContent=txt},3000)}}
           function linkAcct(m){const e=$("le").value.trim();if(!/^\S+@\S+\.\S+$/.test(e)){toast("Adresse e-mail invalide");return}ctx="set";toast(m=="up"?"Création du compte…":"Connexion…");A.acct2(m,e)}
-          $("lu").onclick=()=>linkAcct("up");$("li").onclick=()=>linkAcct("in");
+          $("lu").onclick=()=>linkAcct("up");$("li").onclick=()=>linkAcct("in");$("rv").onclick=()=>{toast("Envoi…");A.resend()};
           $("sy2").onclick=()=>{ctx="set";toast("Synchronisation…");A.push(false)};
           two("pf","Écraser le compte avec ce coffre",()=>{ctx="set";A.push(true)});
           two("pl","Remplacer ce coffre par celui du compte",()=>{ctx="set";A.pull(true)});
